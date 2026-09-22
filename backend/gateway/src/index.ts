@@ -19,9 +19,18 @@ import cors from 'cors';
 import { pinoHttp } from 'pino-http';
 import pino from 'pino';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { HealthResponse, REQUEST_HEADER, ROUTES, USER_HEADER } from '@lumina/contract';
+import { existsSync, readFile } from 'node:fs';
+import {
+  AskBody,
+  CreateSpaceBody,
+  CreateThreadBody,
+  HealthResponse,
+  REQUEST_HEADER,
+  USER_HEADER
+} from '@lumina/contract';
 import { env } from './env.js';
+import { rateLimit, requireUser, validateBody } from './middleware.js';
+import { proxyJson, proxyStream, proxyUpload } from './proxy.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -82,27 +91,51 @@ app.get('/health', async (_req, res) => {
   res.status(ai.status === 'ok' ? 200 : 503).json(body);
 });
 
-// ---------------------------------------------------------------- everything else: 501
+// ---------------------------------------------------------------- /evals/report.json (public)
 
-/**
- * Every contract route answers 501 until you implement it. The UI renders that as
- * "not implemented yet", so the interface is your progress bar: each route you finish
- * lights up a piece of the product.
- */
-const notImplemented = (route: string) => (_req: express.Request, res: express.Response) => {
-  res.status(501).json({
-    error: `not implemented yet: ${route}. Build it in backend/gateway/src/.`,
-    status: 501,
-    requestId: String(res.locals.requestId)
+// The Product Evaluation the eval skill writes. Served from disk, not the agent, and NOT
+// behind X-User-Id: a stranger opening /evals on the Vercel URL must be able to read it.
+app.get('/evals/report.json', (_req, res) => {
+  readFile(env.reportPath, 'utf8', (readErr, data) => {
+    if (readErr) {
+      return void res.status(404).json({
+        error: 'no eval report yet — run the eval skill to write reports/report.json',
+        status: 404,
+        requestId: String(res.locals.requestId)
+      });
+    }
+    res.setHeader('content-type', 'application/json; charset=utf-8');
+    res.send(data);
   });
-};
+});
 
-for (const route of ROUTES) {
-  if (route.path === '/health') continue;
-  const path = route.path.replace(/:(\w+)/g, ':$1');
-  const method = route.method.toLowerCase() as 'get' | 'post' | 'delete';
-  app[method](path, notImplemented(`${route.method} ${route.path}`));
-}
+// ---------------------------------------------------------------- contract routes → agent
+
+// Every route below is authed (401), rate-limited per user (429), and — where it takes a
+// body — validated against the contract (400) before it is mirrored to the agent. The path
+// table is shared, so each request is forwarded to the same path on the agent.
+const guard = [requireUser, rateLimit];
+
+/** Route a thrown proxy error to the 502 error middleware instead of crashing the process. */
+const a =
+  (fn: (req: express.Request, res: express.Response) => Promise<void>) =>
+  (req: express.Request, res: express.Response, next: express.NextFunction) =>
+    fn(req, res).catch(next);
+
+app.get('/stats', guard, a(proxyJson));
+
+app.post('/threads', guard, validateBody(CreateThreadBody), a(proxyJson));
+app.get('/threads', guard, a(proxyJson));
+app.get('/threads/:threadId', guard, a(proxyJson));
+app.post('/threads/:threadId/ask', guard, validateBody(AskBody), a(proxyStream));
+
+app.get('/memory', guard, a(proxyJson));
+app.delete('/memory/:memoryId', guard, a(proxyJson));
+
+app.post('/spaces', guard, validateBody(CreateSpaceBody), a(proxyJson));
+app.get('/spaces', guard, a(proxyJson));
+app.post('/spaces/:spaceId/documents', guard, a(proxyUpload));
+app.get('/spaces/:spaceId/documents', guard, a(proxyJson));
 
 // ---------------------------------------------------------------- static UI
 
@@ -121,6 +154,7 @@ app.use((req, res) => {
 // A thrown error is a 502 with a log line, never a 200 with a plausible body (rule A1).
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   log.error({ err, requestId: res.locals.requestId }, 'gateway error');
+  if (res.headersSent) return; // an SSE stream already owns the response
   res.status(502).json({ error: err.message, status: 502, requestId: String(res.locals.requestId) });
 });
 

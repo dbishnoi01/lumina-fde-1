@@ -11,6 +11,10 @@ const num = (v: string | undefined, fallback: number) => {
 };
 export const env = {
   port: num(process.env.PORT_AGENT ?? process.env.PORT, 8000),
+  // Interface to bind. Default 0.0.0.0 (local dev + Docker). On Render the supervisor sets
+  // 127.0.0.1 so the agent is loopback-only — the red-line "agent not publicly reachable"
+  // without VPC/shared-secret; Render exposes only the gateway's $PORT.
+  host: process.env.AGENT_HOST ?? '0.0.0.0',
   mongoUri: process.env.MONGODB_URI ?? '',
   mongoDb: process.env.MONGODB_DB ?? 'lumina',
   vectorBackend: (process.env.VECTOR_BACKEND ?? 'atlas-vector-search') as
@@ -19,11 +23,15 @@ export const env = {
 
   llmProvider: process.env.LLM_PROVIDER ?? 'anthropic',
   llmModel: process.env.LLM_MODEL ?? 'claude-sonnet-5',
+  // Groq is OpenAI-compatible: same SDK, different baseURL. Anthropic ignores this.
+  llmBaseUrl: process.env.GROQ_BASE_URL ?? 'https://api.groq.com/openai/v1',
 
   searchProvider: (process.env.SEARCH_PROVIDER ?? 'tavily') as 'tavily' | 'serpapi',
   searchCacheTtlSeconds: num(process.env.SEARCH_CACHE_TTL_SECONDS, 21600),
 
-  embeddingModel: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',
+  // Embeddings are decoupled from the LLM: Gemini here, Groq for chat.
+  embeddingProvider: process.env.EMBEDDING_PROVIDER ?? 'gemini',
+  embeddingModel: process.env.EMBEDDING_MODEL ?? 'gemini-embedding-001',
 
   // Deep search is the expensive gear, so its limits are configuration, not code.
   deepSubQuestionsMin: num(process.env.DEEP_SUB_QUESTIONS_MIN, 3),
@@ -45,6 +53,8 @@ export const env = {
 /** Never log or return these. /health names the model; it never echoes a key. */
 export const secrets = {
   anthropic: process.env.ANTHROPIC_API_KEY ?? '',
+  groq: process.env.GROQ_API_KEY ?? '',
+  gemini: process.env.GEMINI_API_KEY ?? '',
   openai: process.env.OPENAI_API_KEY ?? '',
   tavily: process.env.TAVILY_API_KEY ?? '',
   serpapi: process.env.SERPAPI_API_KEY ?? ''

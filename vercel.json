@@ -1,0 +1,8 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "_comment": "Root Vercel config for the monorepo. The UI (web/) depends on the @lumina/contract workspace, so contract must build first. Output is web/dist. The SPA rewrite lets the grader hard-refresh /evals without a 404. Set VITE_API_URL (the public Render gateway URL) in the Vercel project env.",
+  "installCommand": "npm ci",
+  "buildCommand": "npm run build -w @lumina/contract && npm run build -w @lumina/web",
+  "outputDirectory": "web/dist",
+  "rewrites": [{ "source": "/((?!assets/).*)", "destination": "/index.html" }]
+}

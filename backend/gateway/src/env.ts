@@ -19,6 +19,13 @@ export const env = {
     .filter(Boolean),
   rateLimitPerMinute: num(process.env.RATE_LIMIT_PER_MINUTE, 30),
   logLevel: process.env.LOG_LEVEL ?? 'info',
+  /** How long the gateway waits on the agent before it calls the request a 502. */
+  upstreamTimeoutMs: num(process.env.GATEWAY_UPSTREAM_TIMEOUT_MS, 120_000),
   /** Serve the built UI from the gateway in production so one host serves / and /evals. */
-  webDist: resolve(process.cwd(), '../../web/dist')
+  webDist: resolve(process.cwd(), '../../web/dist'),
+  /**
+   * The Product Evaluation the eval skill writes (reports/report.json at the repo root).
+   * The gateway serves it at GET /evals/report.json and the provided UI renders it at /evals.
+   */
+  reportPath: resolve(process.cwd(), '../../reports/report.json')
 } as const;
