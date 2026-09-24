@@ -53,7 +53,7 @@ services:
       - key: LLM_FALLBACK_ENABLED
         value: "true"
       - key: GEMINI_CHAT_MODEL
-        value: gemini-2.0-flash
+        value: gemini-3.6-flash
 
       # ---- Embeddings: Gemini (1536-d) ----
       - key: EMBEDDING_PROVIDER

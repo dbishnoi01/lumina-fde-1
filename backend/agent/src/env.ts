@@ -33,7 +33,7 @@ export const env = {
   // loud. Set LLM_FALLBACK_ENABLED=false to force single-provider behaviour.
   llmFallbackEnabled: (process.env.LLM_FALLBACK_ENABLED ?? 'true') !== 'false',
   geminiBaseUrl: process.env.GEMINI_OPENAI_BASE_URL ?? 'https://generativelanguage.googleapis.com/v1beta/openai',
-  geminiChatModel: process.env.GEMINI_CHAT_MODEL ?? 'gemini-2.0-flash',
+  geminiChatModel: process.env.GEMINI_CHAT_MODEL ?? 'gemini-3.6-flash',
 
   searchProvider: (process.env.SEARCH_PROVIDER ?? 'tavily') as 'tavily' | 'serpapi',
   searchCacheTtlSeconds: num(process.env.SEARCH_CACHE_TTL_SECONDS, 21600),
