@@ -18,11 +18,18 @@
  * embeddings) so an in-flight answer still completes instead of dying. ONLY a rate-limit error
  * triggers the fallback — a genuine resilience feature, not a way to hide a broken provider.
  *
- * Fail loud: any NON-rate-limit provider error throws. There is no "return a plausible answer"
- * path here, and a rate-limit on the last backend still throws.
+ * Transient 5xx: the OpenAI-compatible endpoints (Gemini's especially) intermittently answer a
+ * decision turn with a bare 503/502 ("model overloaded", no body). That is not a broken provider
+ * and not rate-limiting — it is a blip. We retry the SAME backend a few times with a short linear
+ * backoff, and only after those are exhausted do we fall through to the other backend. Retrying
+ * the same provider first keeps the Groq→Gemini transcript-signature invariant intact for the
+ * common case (see {@link backends}).
+ *
+ * Fail loud: a NON-transient, NON-rate-limit provider error throws immediately. Retries are
+ * bounded, and if every attempt on every backend still fails the last error is re-thrown. There
+ * is no "return a plausible answer" path here.
  */
 import OpenAI from 'openai';
-import type { Stream } from 'openai/streaming';
 import { env, secrets } from '../env.js';
 
 export interface LlmTool {
@@ -132,6 +139,63 @@ function isRateLimited(err: unknown): boolean {
   return /\b429\b|rate limit|tokens per (day|minute)|\bTPD\b|\bTPM\b|quota|resource has been exhausted/i.test(msg);
 }
 
+/**
+ * A transient upstream failure worth a same-backend retry: a 5xx (overloaded / unavailable /
+ * gateway) or a dropped connection. Deliberately NOT a 4xx (a 400/404/422 is our bug or a bad
+ * request and must fail loud, not be masked by retries) and NOT a 429 (that is {@link isRateLimited}
+ * and triggers a provider fallback instead). The observed Gemini shape is a bare "503 status code
+ * (no body)", surfaced by the SDK as an error with `status: 503`, so status is the primary signal.
+ */
+function isTransient(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const status = (err as { status?: number }).status;
+  if (typeof status === 'number' && status >= 500 && status <= 599) return true;
+  // Network-level drops carry no HTTP status; the SDK raises APIConnectionError / a Node code.
+  const code = String((err as { code?: string }).code ?? '');
+  if (/ECONNRESET|ETIMEDOUT|ECONNREFUSED|EPIPE|ENOTFOUND/.test(code)) return true;
+  const msg = String((err as { message?: string }).message ?? '');
+  return /\b(500|502|503|504)\b|overloaded|temporarily unavailable|service unavailable|connection error|socket hang up/i.test(msg);
+}
+
+const RETRY_ATTEMPTS = 3; // total tries per backend before falling through / throwing
+const RETRY_BASE_MS = 600; // linear backoff: 600ms, then 1200ms between the 3 attempts
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Run `attempt` against each backend in order (primary first). Within a backend, a transient 5xx
+ * is retried up to {@link RETRY_ATTEMPTS} times with a linear backoff; once those are exhausted —
+ * or on a rate-limit — we advance to the next backend if one remains. A non-transient,
+ * non-rate-limit error throws immediately (fail loud). If nothing succeeds, the last error is
+ * re-thrown. `attempt` must be idempotent: for a stream it opens (but does not consume) it, so a
+ * retry never replays partially-emitted tokens.
+ */
+async function withBackends<T>(attempt: (b: Backend) => Promise<T>): Promise<T> {
+  const list = backends();
+  let lastErr: unknown;
+  for (let i = 0; i < list.length; i++) {
+    const b = list[i]!;
+    const hasNext = i < list.length - 1;
+    for (let a = 0; a < RETRY_ATTEMPTS; a++) {
+      try {
+        return await attempt(b);
+      } catch (err) {
+        lastErr = err;
+        // Transient blip on this backend: retry it before giving up on it.
+        if (isTransient(err) && a < RETRY_ATTEMPTS - 1) {
+          await sleep(RETRY_BASE_MS * (a + 1));
+          continue;
+        }
+        // Retries exhausted (transient) or a rate-limit: fall through to the next backend if any.
+        if ((isTransient(err) || isRateLimited(err)) && hasNext) break;
+        // Anything else — or the last backend — fails loud.
+        throw err;
+      }
+    }
+  }
+  throw lastErr;
+}
+
 function toOpenAiTools(tools: LlmTool[]): OpenAI.Chat.Completions.ChatCompletionTool[] {
   return tools.map((t) => ({
     type: 'function',
@@ -193,33 +257,22 @@ export async function chat(
     typeof opts.toolChoice === 'object'
       ? ({ type: 'function', function: { name: opts.toolChoice.name } } as const)
       : (opts.toolChoice ?? 'auto');
-  const list = backends();
-  let lastErr: unknown;
-  for (let i = 0; i < list.length; i++) {
-    const b = list[i]!;
-    try {
-      const res = await b.client.chat.completions.create({
-        model: b.model,
-        messages,
-        ...(tools.length > 0 ? { tools: toOpenAiTools(tools), tool_choice: toolChoice } : {}),
-        temperature: 0.2,
-        stream: false
-      });
-      const choice = res.choices[0];
-      if (!choice) throw new Error('llm returned no choices');
-      return {
-        content: choice.message.content ?? '',
-        toolCalls: parseToolCalls(choice.message),
-        usage: { in: res.usage?.prompt_tokens ?? 0, out: res.usage?.completion_tokens ?? 0 }
-      };
-    } catch (err) {
-      lastErr = err;
-      // Advance to the next backend only on a rate-limit, and only if one remains.
-      if (isRateLimited(err) && i < list.length - 1) continue;
-      throw err;
-    }
-  }
-  throw lastErr;
+  const res = await withBackends((b) =>
+    b.client.chat.completions.create({
+      model: b.model,
+      messages,
+      ...(tools.length > 0 ? { tools: toOpenAiTools(tools), tool_choice: toolChoice } : {}),
+      temperature: 0.2,
+      stream: false
+    })
+  );
+  const choice = res.choices[0];
+  if (!choice) throw new Error('llm returned no choices');
+  return {
+    content: choice.message.content ?? '',
+    toolCalls: parseToolCalls(choice.message),
+    usage: { in: res.usage?.prompt_tokens ?? 0, out: res.usage?.completion_tokens ?? 0 }
+  };
 }
 
 /**
@@ -231,39 +284,29 @@ export async function streamChat(
   messages: LlmMessage[],
   onToken: (text: string) => void
 ): Promise<{ content: string; usage: Usage }> {
-  const list = backends();
-  let lastErr: unknown;
-  for (let i = 0; i < list.length; i++) {
-    const b = list[i]!;
-    // Open the stream first. A 429 (incl. Groq's daily token cap) is returned as the initial
-    // response before any token arrives, so we can safely fall back here without ever having
-    // emitted a partial answer. Once the stream is open we consume it — no mid-stream failover.
-    let stream: Stream<OpenAI.Chat.Completions.ChatCompletionChunk>;
-    try {
-      stream = await b.client.chat.completions.create({
-        model: b.model,
-        messages,
-        temperature: 0.2,
-        stream: true,
-        stream_options: { include_usage: true }
-      });
-    } catch (err) {
-      lastErr = err;
-      if (isRateLimited(err) && i < list.length - 1) continue;
-      throw err;
-    }
+  // Open the stream first. A 429 (incl. Groq's daily token cap) or a transient 5xx is returned as
+  // the initial response before any token arrives, so withBackends can retry/fall back here without
+  // ever having emitted a partial answer. Once the stream is open we consume it — no mid-stream
+  // failover, so a token that has already reached the SSE channel is never replayed.
+  const stream = await withBackends((b) =>
+    b.client.chat.completions.create({
+      model: b.model,
+      messages,
+      temperature: 0.2,
+      stream: true,
+      stream_options: { include_usage: true }
+    })
+  );
 
-    let content = '';
-    let usage: Usage = { in: 0, out: 0 };
-    for await (const chunk of stream) {
-      const delta = chunk.choices[0]?.delta?.content;
-      if (delta) {
-        content += delta;
-        onToken(delta);
-      }
-      if (chunk.usage) usage = { in: chunk.usage.prompt_tokens, out: chunk.usage.completion_tokens };
+  let content = '';
+  let usage: Usage = { in: 0, out: 0 };
+  for await (const chunk of stream) {
+    const delta = chunk.choices[0]?.delta?.content;
+    if (delta) {
+      content += delta;
+      onToken(delta);
     }
-    return { content, usage };
+    if (chunk.usage) usage = { in: chunk.usage.prompt_tokens, out: chunk.usage.completion_tokens };
   }
-  throw lastErr;
+  return { content, usage };
 }
