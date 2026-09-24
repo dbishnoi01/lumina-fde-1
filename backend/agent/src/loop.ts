@@ -141,7 +141,9 @@ async function research(
 
     messages.push({
       role: 'assistant',
-      content: res.content || '',
+      // Canonical OpenAI shape for a tool-call turn is content:null, not "". Groq tolerates
+      // the empty string; Gemini's OpenAI-compatible endpoint (the fallback) 400s on it.
+      content: res.content || null,
       tool_calls: res.toolCalls.map((tc) => ({
         id: tc.id,
         type: 'function',
