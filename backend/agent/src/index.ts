@@ -27,6 +27,7 @@ import { env } from './env.js';
 import { pingDb } from './db.js';
 import { emitter, sseHeaders } from './sse.js';
 import { runAsk } from './loop.js';
+import { primaryModel } from './providers/llm.js';
 import {
   appendUserMessage,
   createThread,
@@ -81,7 +82,7 @@ app.get('/health', async (_req, res) => {
   const dbStatus = await pingDb();
   const body: HealthResponse = {
     status: dbStatus === 'ok' ? 'ok' : 'degraded',
-    model: env.llmModel,
+    model: primaryModel(),
     searchProvider: env.searchProvider,
     vectorStore: env.vectorBackend,
     db: dbStatus,
@@ -275,7 +276,7 @@ app.listen(env.port, env.host, () => {
   log.info(
     {
       port: env.port,
-      model: env.llmModel,
+      model: primaryModel(),
       searchProvider: env.searchProvider,
       vectorStore: env.vectorBackend,
       caps: {

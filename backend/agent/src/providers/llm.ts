@@ -71,26 +71,53 @@ interface Backend {
 let groqClient: OpenAI | null = null;
 let geminiClient: OpenAI | null = null;
 
+function groqBackend(): Backend {
+  if (!secrets.groq) throw new Error('GROQ_API_KEY is not set');
+  if (!groqClient) groqClient = new OpenAI({ apiKey: secrets.groq, baseURL: env.llmBaseUrl });
+  return { client: groqClient, model: env.llmModel, label: 'groq' };
+}
+
+function geminiBackend(): Backend {
+  if (!secrets.gemini) throw new Error('GEMINI_API_KEY is not set');
+  if (!geminiClient) geminiClient = new OpenAI({ apiKey: secrets.gemini, baseURL: env.geminiBaseUrl });
+  return { client: geminiClient, model: env.geminiChatModel, label: 'gemini' };
+}
+
 /**
- * The ordered list of backends: Groq (primary), then Gemini (fallback) when enabled and its
- * key is present. Callers try each in order but only advance past one on a rate-limit error
- * (see {@link isRateLimited}); any other failure throws from the first backend.
+ * The ordered list of backends, primary first. LLM_PROVIDER picks the primary; the OTHER
+ * provider is appended as the fallback when LLM_FALLBACK_ENABLED and its key is present.
+ * Callers try each in order but only advance past one on a rate-limit error (see
+ * {@link isRateLimited}); any other failure throws from the first backend.
+ *
+ * IMPORTANT — do not build a Groq→Gemini MIXED transcript. Gemini 3.x requires a
+ * thought_signature on every tool call in the history (see assistantToolCallMessage); a Groq
+ * tool call has none, so if Groq serves the early turns of a request and THEN rate-limits, the
+ * fall-through to Gemini sends it unsigned Groq calls and Gemini 400s the whole transcript. The
+ * per-call fallback therefore only reliably recovers when the primary rate-limits on the FIRST
+ * turn (nothing unsigned in the transcript yet). To run a whole request on one provider, set
+ * LLM_PROVIDER to that provider and LLM_FALLBACK_ENABLED=false.
  */
 function backends(): Backend[] {
   if (env.llmProvider === 'anthropic') {
     // Deliberate: the $0 path is Groq. Wire @anthropic-ai/sdk here if you switch for the
     // deep-quality human gate — do not silently fall through to a wrong provider.
-    throw new Error('LLM_PROVIDER=anthropic not wired; add @anthropic-ai/sdk or use LLM_PROVIDER=groq');
+    throw new Error('LLM_PROVIDER=anthropic not wired; add @anthropic-ai/sdk or use LLM_PROVIDER=groq|gemini');
   }
-  if (!secrets.groq) throw new Error('GROQ_API_KEY is not set');
-  if (!groqClient) groqClient = new OpenAI({ apiKey: secrets.groq, baseURL: env.llmBaseUrl });
-  const list: Backend[] = [{ client: groqClient, model: env.llmModel, label: 'groq' }];
+  const primaryIsGemini = env.llmProvider === 'gemini';
+  const primary = primaryIsGemini ? geminiBackend() : groqBackend();
+  const list: Backend[] = [primary];
 
-  if (env.llmFallbackEnabled && secrets.gemini) {
-    if (!geminiClient) geminiClient = new OpenAI({ apiKey: secrets.gemini, baseURL: env.geminiBaseUrl });
-    list.push({ client: geminiClient, model: env.geminiChatModel, label: 'gemini' });
+  if (env.llmFallbackEnabled) {
+    // Append the other provider as fallback, only when its key is set.
+    if (primaryIsGemini && secrets.groq) list.push(groqBackend());
+    else if (!primaryIsGemini && secrets.gemini) list.push(geminiBackend());
   }
   return list;
+}
+
+/** The model string the primary backend will report — used for honest run-log/done reporting. */
+export function primaryModel(): string {
+  return env.llmProvider === 'gemini' ? env.geminiChatModel : env.llmModel;
 }
 
 /**

@@ -30,7 +30,7 @@ import {
   type ToolName
 } from '@lumina/contract';
 import type { Emit } from './sse.js';
-import { assistantToolCallMessage, chat, streamChat, type ChatResult, type LlmMessage, type LlmTool, type Usage } from './providers/llm.js';
+import { assistantToolCallMessage, chat, primaryModel, streamChat, type ChatResult, type LlmMessage, type LlmTool, type Usage } from './providers/llm.js';
 import { llmCostUsd, searchCostUsd } from './cost.js';
 import { recordAnswer } from './metrics.js';
 import { SearchTally } from './cache.js';
@@ -386,7 +386,7 @@ function finishDone(
     answerId,
     latencyMs: now - params.requestStart,
     ttftMs: (firstTokenAt ?? now) - params.requestStart,
-    model: env.llmModel,
+    model: primaryModel(),
     tokens: { in: state.usage.in, out: state.usage.out },
     costUsd,
     searchCached: tally.allCached,

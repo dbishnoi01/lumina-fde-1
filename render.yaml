@@ -39,21 +39,27 @@ services:
       - key: VECTOR_BACKEND
         value: atlas-vector-search
 
-      # ---- LLM: Groq (OpenAI-compatible) ----
+      # ---- LLM provider ----
+      # Primary is LLM_PROVIDER; the other provider is the fallback (only when
+      # LLM_FALLBACK_ENABLED and its key is set). We run Gemini as primary: Groq's free tier
+      # is only PARTIALLY available (its 200k-TPD cap frees a little at a time), so it serves
+      # a few turns then 429s mid-request — and because Gemini 3.x demands a thought_signature
+      # on every tool call in the history, a Groq→Gemini MIXED transcript hard-400s. Running
+      # the whole request on Gemini (fallback OFF) keeps every tool call signed and consistent.
+      # gpt-oss-120b on Groq remains the $0 path: set LLM_PROVIDER=groq when its cap resets.
       - key: LLM_PROVIDER
-        value: groq
+        value: gemini
+      - key: LLM_FALLBACK_ENABLED
+        value: "false"
+      - key: GEMINI_CHAT_MODEL
+        value: gemini-3.5-flash-lite
+      # Groq config, kept for the $0 path (LLM_PROVIDER=groq).
       - key: LLM_MODEL
         value: openai/gpt-oss-120b
       - key: GROQ_BASE_URL
         value: https://api.groq.com/openai/v1
       - key: GROQ_API_KEY
         sync: false
-      # Fallback when Groq hits its free daily token cap (429): retry on Gemini's
-      # OpenAI-compatible endpoint, reusing GEMINI_API_KEY below. Only a rate-limit trips it.
-      - key: LLM_FALLBACK_ENABLED
-        value: "true"
-      - key: GEMINI_CHAT_MODEL
-        value: gemini-3.5-flash-lite
 
       # ---- Embeddings: Gemini (1536-d) ----
       - key: EMBEDDING_PROVIDER
