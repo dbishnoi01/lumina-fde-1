@@ -14,11 +14,40 @@ import { Readability } from '@mozilla/readability';
 /** Cap extracted text so one long page cannot blow the synthesis prompt (and the token bill). */
 const MAX_PAGE_CHARS = 12_000;
 const FETCH_TIMEOUT_MS = 8_000;
+/**
+ * Cap the raw bytes we pull off the wire BEFORE we build a DOM. Both `res.text()` and JSDOM
+ * hold the whole page in memory (JSDOM at several times its size), so an unbounded fetch of a
+ * large page or a binary served with a fooling content-type OOM-kills a small container. We
+ * read at most this many bytes and truncate; a partial HTML tail is fine — JSDOM is lenient
+ * and Readability only needs the article body, which is near the top.
+ */
+const MAX_FETCH_BYTES = 1_500_000;
 
 export interface FetchedPage {
   url: string;
   title: string;
   text: string;
+}
+
+/** Stream the body and stop once we have MAX_FETCH_BYTES, so one page cannot balloon memory. */
+async function readCapped(res: Response): Promise<string> {
+  const reader = res.body?.getReader();
+  if (!reader) return (await res.text()).slice(0, MAX_FETCH_BYTES);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      total += value.byteLength;
+      if (total >= MAX_FETCH_BYTES) {
+        await reader.cancel();
+        break;
+      }
+    }
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 export async function fetchPage(url: string): Promise<FetchedPage> {
@@ -34,7 +63,14 @@ export async function fetchPage(url: string): Promise<FetchedPage> {
   });
   if (!res.ok) throw new Error(`fetch ${res.status} for ${url}`);
 
-  const html = await res.text();
+  // Only parse markup. A PDF/image/zip fed to JSDOM is wasted memory (and on a small container,
+  // an OOM); reject it up front so the caller records an honest ok:false and the model moves on.
+  const ctype = res.headers.get('content-type') ?? '';
+  if (ctype && !/(text\/html|application\/xhtml|text\/plain|application\/xml|text\/xml)/i.test(ctype)) {
+    throw new Error(`unsupported content-type "${ctype.split(';')[0]}" for ${url}`);
+  }
+
+  const html = await readCapped(res);
   const dom = new JSDOM(html, { url });
   const article = new Readability(dom.window.document).parse();
 
