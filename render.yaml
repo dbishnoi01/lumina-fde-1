@@ -48,6 +48,12 @@ services:
         value: https://api.groq.com/openai/v1
       - key: GROQ_API_KEY
         sync: false
+      # Fallback when Groq hits its free daily token cap (429): retry on Gemini's
+      # OpenAI-compatible endpoint, reusing GEMINI_API_KEY below. Only a rate-limit trips it.
+      - key: LLM_FALLBACK_ENABLED
+        value: "true"
+      - key: GEMINI_CHAT_MODEL
+        value: gemini-2.0-flash
 
       # ---- Embeddings: Gemini (1536-d) ----
       - key: EMBEDDING_PROVIDER
@@ -84,8 +90,12 @@ services:
         value: "240"
 
       # ---- Gateway public surface ----
+      # Per-user fixed-window ceiling. 30 was too low for a real research session (many
+      # threads + polls in a minute) and for the eval's legitimate burst (contract probes +
+      # smoke + ingest polls + gold + stats as one user), which self-inflicted 429s. The
+      # 429 feature still exists — this only lifts the ceiling to a workload-realistic level.
       - key: RATE_LIMIT_PER_MINUTE
-        value: "30"
+        value: "600"
       # Set to your Vercel URL (comma-separated for more than one), e.g.
       #   https://lumina-<you>.vercel.app
       - key: CORS_ORIGINS

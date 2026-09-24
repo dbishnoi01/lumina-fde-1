@@ -13,9 +13,16 @@
  *   - `chat()`      one decision turn: the model either asks for a tool or answers. Not streamed.
  *   - `streamChat()` the final synthesis turn: tokens streamed to the SSE channel as written.
  *
- * Fail loud: any provider error throws. There is no "return a plausible answer" path here.
+ * Provider fallback: Groq's free tier has a hard daily token cap. When it 429s we retry the
+ * SAME request against Gemini's OpenAI-compatible endpoint (same SDK, key already deployed for
+ * embeddings) so an in-flight answer still completes instead of dying. ONLY a rate-limit error
+ * triggers the fallback — a genuine resilience feature, not a way to hide a broken provider.
+ *
+ * Fail loud: any NON-rate-limit provider error throws. There is no "return a plausible answer"
+ * path here, and a rate-limit on the last backend still throws.
  */
 import OpenAI from 'openai';
+import type { Stream } from 'openai/streaming';
 import { env, secrets } from '../env.js';
 
 export interface LlmTool {
@@ -47,18 +54,48 @@ export interface ChatResult {
   usage: Usage;
 }
 
-let client: OpenAI | null = null;
-function openai(): OpenAI {
+/** One OpenAI-compatible endpoint the loop can talk to, tried in order (primary first). */
+interface Backend {
+  client: OpenAI;
+  model: string;
+  label: string;
+}
+
+let groqClient: OpenAI | null = null;
+let geminiClient: OpenAI | null = null;
+
+/**
+ * The ordered list of backends: Groq (primary), then Gemini (fallback) when enabled and its
+ * key is present. Callers try each in order but only advance past one on a rate-limit error
+ * (see {@link isRateLimited}); any other failure throws from the first backend.
+ */
+function backends(): Backend[] {
   if (env.llmProvider === 'anthropic') {
     // Deliberate: the $0 path is Groq. Wire @anthropic-ai/sdk here if you switch for the
     // deep-quality human gate — do not silently fall through to a wrong provider.
     throw new Error('LLM_PROVIDER=anthropic not wired; add @anthropic-ai/sdk or use LLM_PROVIDER=groq');
   }
-  if (!client) {
-    if (!secrets.groq) throw new Error('GROQ_API_KEY is not set');
-    client = new OpenAI({ apiKey: secrets.groq, baseURL: env.llmBaseUrl });
+  if (!secrets.groq) throw new Error('GROQ_API_KEY is not set');
+  if (!groqClient) groqClient = new OpenAI({ apiKey: secrets.groq, baseURL: env.llmBaseUrl });
+  const list: Backend[] = [{ client: groqClient, model: env.llmModel, label: 'groq' }];
+
+  if (env.llmFallbackEnabled && secrets.gemini) {
+    if (!geminiClient) geminiClient = new OpenAI({ apiKey: secrets.gemini, baseURL: env.geminiBaseUrl });
+    list.push({ client: geminiClient, model: env.geminiChatModel, label: 'gemini' });
   }
-  return client;
+  return list;
+}
+
+/**
+ * A rate-limit / quota rejection — the only error class that should trip the fallback. Covers
+ * the OpenAI SDK's 429 status and the shapes Groq/Gemini phrase it in (per-minute, per-day
+ * token caps, quota exhaustion), which arrive as a 429 with an explanatory message.
+ */
+function isRateLimited(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  if ((err as { status?: number }).status === 429) return true;
+  const msg = String((err as { message?: string }).message ?? '');
+  return /\b429\b|rate limit|tokens per (day|minute)|\bTPD\b|\bTPM\b|quota|resource has been exhausted/i.test(msg);
 }
 
 function toOpenAiTools(tools: LlmTool[]): OpenAI.Chat.Completions.ChatCompletionTool[] {
@@ -98,20 +135,33 @@ export async function chat(
     typeof opts.toolChoice === 'object'
       ? ({ type: 'function', function: { name: opts.toolChoice.name } } as const)
       : (opts.toolChoice ?? 'auto');
-  const res = await openai().chat.completions.create({
-    model: env.llmModel,
-    messages,
-    ...(tools.length > 0 ? { tools: toOpenAiTools(tools), tool_choice: toolChoice } : {}),
-    temperature: 0.2,
-    stream: false
-  });
-  const choice = res.choices[0];
-  if (!choice) throw new Error('llm returned no choices');
-  return {
-    content: choice.message.content ?? '',
-    toolCalls: parseToolCalls(choice.message),
-    usage: { in: res.usage?.prompt_tokens ?? 0, out: res.usage?.completion_tokens ?? 0 }
-  };
+  const list = backends();
+  let lastErr: unknown;
+  for (let i = 0; i < list.length; i++) {
+    const b = list[i]!;
+    try {
+      const res = await b.client.chat.completions.create({
+        model: b.model,
+        messages,
+        ...(tools.length > 0 ? { tools: toOpenAiTools(tools), tool_choice: toolChoice } : {}),
+        temperature: 0.2,
+        stream: false
+      });
+      const choice = res.choices[0];
+      if (!choice) throw new Error('llm returned no choices');
+      return {
+        content: choice.message.content ?? '',
+        toolCalls: parseToolCalls(choice.message),
+        usage: { in: res.usage?.prompt_tokens ?? 0, out: res.usage?.completion_tokens ?? 0 }
+      };
+    } catch (err) {
+      lastErr = err;
+      // Advance to the next backend only on a rate-limit, and only if one remains.
+      if (isRateLimited(err) && i < list.length - 1) continue;
+      throw err;
+    }
+  }
+  throw lastErr;
 }
 
 /**
@@ -123,23 +173,39 @@ export async function streamChat(
   messages: LlmMessage[],
   onToken: (text: string) => void
 ): Promise<{ content: string; usage: Usage }> {
-  const stream = await openai().chat.completions.create({
-    model: env.llmModel,
-    messages,
-    temperature: 0.2,
-    stream: true,
-    stream_options: { include_usage: true }
-  });
-
-  let content = '';
-  let usage: Usage = { in: 0, out: 0 };
-  for await (const chunk of stream) {
-    const delta = chunk.choices[0]?.delta?.content;
-    if (delta) {
-      content += delta;
-      onToken(delta);
+  const list = backends();
+  let lastErr: unknown;
+  for (let i = 0; i < list.length; i++) {
+    const b = list[i]!;
+    // Open the stream first. A 429 (incl. Groq's daily token cap) is returned as the initial
+    // response before any token arrives, so we can safely fall back here without ever having
+    // emitted a partial answer. Once the stream is open we consume it — no mid-stream failover.
+    let stream: Stream<OpenAI.Chat.Completions.ChatCompletionChunk>;
+    try {
+      stream = await b.client.chat.completions.create({
+        model: b.model,
+        messages,
+        temperature: 0.2,
+        stream: true,
+        stream_options: { include_usage: true }
+      });
+    } catch (err) {
+      lastErr = err;
+      if (isRateLimited(err) && i < list.length - 1) continue;
+      throw err;
     }
-    if (chunk.usage) usage = { in: chunk.usage.prompt_tokens, out: chunk.usage.completion_tokens };
+
+    let content = '';
+    let usage: Usage = { in: 0, out: 0 };
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta?.content;
+      if (delta) {
+        content += delta;
+        onToken(delta);
+      }
+      if (chunk.usage) usage = { in: chunk.usage.prompt_tokens, out: chunk.usage.completion_tokens };
+    }
+    return { content, usage };
   }
-  return { content, usage };
+  throw lastErr;
 }

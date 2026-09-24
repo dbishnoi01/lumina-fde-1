@@ -26,6 +26,15 @@ export const env = {
   // Groq is OpenAI-compatible: same SDK, different baseURL. Anthropic ignores this.
   llmBaseUrl: process.env.GROQ_BASE_URL ?? 'https://api.groq.com/openai/v1',
 
+  // Fallback LLM: Groq's free tier has a hard daily token cap (200k TPD); when it 429s a run
+  // would die mid-answer. Gemini publishes an OpenAI-compatible endpoint, so the SAME openai
+  // SDK reaches it by swapping baseURL + model, reusing GEMINI_API_KEY (already set for
+  // embeddings). Only a rate-limit error trips the fallback — every other error still fails
+  // loud. Set LLM_FALLBACK_ENABLED=false to force single-provider behaviour.
+  llmFallbackEnabled: (process.env.LLM_FALLBACK_ENABLED ?? 'true') !== 'false',
+  geminiBaseUrl: process.env.GEMINI_OPENAI_BASE_URL ?? 'https://generativelanguage.googleapis.com/v1beta/openai',
+  geminiChatModel: process.env.GEMINI_CHAT_MODEL ?? 'gemini-2.0-flash',
+
   searchProvider: (process.env.SEARCH_PROVIDER ?? 'tavily') as 'tavily' | 'serpapi',
   searchCacheTtlSeconds: num(process.env.SEARCH_CACHE_TTL_SECONDS, 21600),
 
