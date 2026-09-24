@@ -30,7 +30,7 @@ import {
   type ToolName
 } from '@lumina/contract';
 import type { Emit } from './sse.js';
-import { chat, streamChat, type ChatResult, type LlmMessage, type LlmTool, type Usage } from './providers/llm.js';
+import { assistantToolCallMessage, chat, streamChat, type ChatResult, type LlmMessage, type LlmTool, type Usage } from './providers/llm.js';
 import { llmCostUsd, searchCostUsd } from './cost.js';
 import { recordAnswer } from './metrics.js';
 import { SearchTally } from './cache.js';
@@ -139,17 +139,10 @@ async function research(
 
     if (res.toolCalls.length === 0) return; // model is ready to answer
 
-    messages.push({
-      role: 'assistant',
-      // Canonical OpenAI shape for a tool-call turn is content:null, not "". Groq tolerates
-      // the empty string; Gemini's OpenAI-compatible endpoint (the fallback) 400s on it.
-      content: res.content || null,
-      tool_calls: res.toolCalls.map((tc) => ({
-        id: tc.id,
-        type: 'function',
-        function: { name: tc.name, arguments: JSON.stringify(tc.args) }
-      }))
-    });
+    // Replay the decision turn. The message shape (content:null, and Gemini's required
+    // thought_signature echoed back via extra_content) is built in the provider module where
+    // the OpenAI types live — see assistantToolCallMessage.
+    messages.push(assistantToolCallMessage(res.content, res.toolCalls));
 
     for (const tc of res.toolCalls) {
       if (state.toolCallsLog.length >= state.maxToolCalls || localCalls >= localToolBudget) {

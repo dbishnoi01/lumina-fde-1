@@ -37,6 +37,13 @@ export interface ToolCall {
   name: string;
   /** Parsed arguments. Throws upstream if the model emitted invalid JSON. */
   args: Record<string, unknown>;
+  /**
+   * Provider-specific blob that MUST be echoed back verbatim on the assistant tool-call turn.
+   * Gemini 3.x puts a `thought_signature` here (extra_content.google.thought_signature) and its
+   * OpenAI-compatible endpoint 400s ("Function call is missing a thought_signature") if the
+   * signature is dropped when the transcript is replayed. Groq does not set it; undefined then.
+   */
+  extra?: Record<string, unknown>;
 }
 
 export interface Usage {
@@ -117,8 +124,32 @@ function parseToolCalls(message: OpenAI.Chat.Completions.ChatCompletionMessage):
         throw new Error(`model emitted invalid JSON args for ${c.function.name}: ${c.function.arguments.slice(0, 200)}`);
       }
     }
-    return { id: c.id, name: c.function.name, args };
+    // Preserve Gemini's extra_content (thought_signature) so the loop can replay it; harmless
+    // when absent (Groq). Typed loosely — extra_content is a Gemini extension, not in the SDK type.
+    const extra = (c as { extra_content?: Record<string, unknown> }).extra_content;
+    return { id: c.id, name: c.function.name, args, ...(extra ? { extra } : {}) };
   });
+}
+
+/**
+ * Build the assistant message that replays a decision turn back to the model. Two provider
+ * quirks live here so the loop does not have to know them:
+ *   - content is null (not ""), the canonical OpenAI shape for a tool-call turn — Gemini 400s on "".
+ *   - each tool call carries back its extra_content (Gemini's thought_signature) when present;
+ *     Gemini's endpoint rejects the transcript with a 400 if that signature is dropped on replay.
+ * The `as` cast is because extra_content is a Gemini extension not modelled in the SDK's type.
+ */
+export function assistantToolCallMessage(content: string, toolCalls: ToolCall[]): LlmMessage {
+  return {
+    role: 'assistant',
+    content: content || null,
+    tool_calls: toolCalls.map((tc) => ({
+      id: tc.id,
+      type: 'function' as const,
+      ...(tc.extra ? { extra_content: tc.extra } : {}),
+      function: { name: tc.name, arguments: JSON.stringify(tc.args) }
+    })) as OpenAI.Chat.Completions.ChatCompletionMessageToolCall[]
+  };
 }
 
 /**
