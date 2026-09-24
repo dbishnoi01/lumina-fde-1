@@ -2,26 +2,44 @@
  * fetch_page: pull a URL and extract its readable text. The rule is "pages fetched and read,
  * not snippets" — a web citation's snippet must be a passage that is actually in the page, and
  * the bench proves it by re-fetching the URL and looking for the snippet in the real HTML. So
- * we read the page here, extract the article body with Readability, and every web source's
- * snippet is a verbatim slice of THIS text.
+ * we read the page here, strip it to visible text, and every web source's snippet is a verbatim
+ * slice of THIS text.
+ *
+ * We extract with the SAME strip-tags pass the bench uses to build its grounding haystack, so
+ * our snippets and its re-fetch tokenize identically. We deliberately do NOT build a full DOM
+ * (JSDOM + Readability): both are synchronous and CPU-heavy, and on a large or pathological page
+ * they block the single-threaded event loop long enough that the agent can't even answer its own
+ * /health — the container then looks dead and gets restarted mid-request. A bounded regex strip
+ * is linear-time and never hangs.
  *
  * Fail loud: a fetch that 404s or times out throws, so the trace step is honestly ok:false with
  * an error rather than an empty page passed off as read.
  */
-import { JSDOM } from 'jsdom';
-import { Readability } from '@mozilla/readability';
 
 /** Cap extracted text so one long page cannot blow the synthesis prompt (and the token bill). */
 const MAX_PAGE_CHARS = 12_000;
 const FETCH_TIMEOUT_MS = 8_000;
 /**
- * Cap the raw bytes we pull off the wire BEFORE we build a DOM. Both `res.text()` and JSDOM
- * hold the whole page in memory (JSDOM at several times its size), so an unbounded fetch of a
- * large page or a binary served with a fooling content-type OOM-kills a small container. We
- * read at most this many bytes and truncate; a partial HTML tail is fine — JSDOM is lenient
- * and Readability only needs the article body, which is near the top.
+ * Cap the raw bytes we pull off the wire before we touch them: `res.text()` and the strip pass
+ * both hold the page in memory, so an unbounded fetch of a huge page or a binary served with a
+ * fooling content-type can OOM a small container. Read at most this many bytes and truncate — a
+ * partial HTML tail is fine, the article body we want is near the top.
  */
 const MAX_FETCH_BYTES = 1_500_000;
+
+/**
+ * Strip HTML to visible text with linear-time regexes only (no nested quantifiers that could
+ * backtrack). This mirrors the benchmark's own stripHtml so the tokens we cite line up with the
+ * tokens it re-fetches. Order matters: kill script/style bodies before dropping tags, so their
+ * contents don't survive as text.
+ */
+function stripToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z#0-9]+;/gi, ' ');
+}
 
 export interface FetchedPage {
   url: string;
@@ -63,21 +81,18 @@ export async function fetchPage(url: string): Promise<FetchedPage> {
   });
   if (!res.ok) throw new Error(`fetch ${res.status} for ${url}`);
 
-  // Only parse markup. A PDF/image/zip fed to JSDOM is wasted memory (and on a small container,
-  // an OOM); reject it up front so the caller records an honest ok:false and the model moves on.
+  // Only parse markup. Stripping a PDF/image/zip yields garbage, not text; reject it up front so
+  // the caller records an honest ok:false and the model moves on to a real page.
   const ctype = res.headers.get('content-type') ?? '';
   if (ctype && !/(text\/html|application\/xhtml|text\/plain|application\/xml|text\/xml)/i.test(ctype)) {
     throw new Error(`unsupported content-type "${ctype.split(';')[0]}" for ${url}`);
   }
 
   const html = await readCapped(res);
-  const dom = new JSDOM(html, { url });
-  const article = new Readability(dom.window.document).parse();
 
-  const title = article?.title?.trim() || dom.window.document.title?.trim() || url;
-  // Readability gives clean text; fall back to the stripped body if it declined to parse.
-  const raw = (article?.textContent ?? dom.window.document.body?.textContent ?? '').replace(/\s+\n/g, '\n');
-  const text = raw.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, MAX_PAGE_CHARS);
+  const rawTitle = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1];
+  const title = (rawTitle ? stripToText(rawTitle) : '').replace(/\s+/g, ' ').trim() || url;
+  const text = stripToText(html).replace(/\s+/g, ' ').trim().slice(0, MAX_PAGE_CHARS);
 
   if (!text) throw new Error(`no readable text extracted from ${url}`);
   return { url, title, text };
