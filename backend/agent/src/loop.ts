@@ -335,12 +335,17 @@ export async function runAsk(params: AskParams): Promise<void> {
     params.emit('sources', sources);
 
     const memories = await memoriesP;
-    const synth = await streamChat(buildSynthMessages(params, sources, memories), (text) => {
+    // Filter the streamed tokens: normalize brackets and drop any [n] with no matching source
+    // before it reaches the client, so a dangling citation is never emitted (automatic-fail rule).
+    const filter = makeCitationFilter(sources.length, (text) => {
       if (firstTokenAt === null) firstTokenAt = Date.now();
-      params.emit('token', { text: normalizeCitations(text) });
+      params.emit('token', { text });
     });
+    const synth = await streamChat(buildSynthMessages(params, sources, memories), (text) => filter.push(text));
+    filter.end();
     addUsage(state.usage, synth.usage);
-    content = normalizeCitations(synth.content);
+    // Persist the same text the client saw: normalized and with ungrounded citations removed.
+    content = dropUngroundedCitations(normalizeCitations(synth.content), sources.length);
 
     const done = finishDone(params, state, answerId, firstTokenAt, tally, subQuestions);
     params.emit('done', done);
@@ -370,6 +375,59 @@ function normalizeCitations(text: string): string {
     .replace(/［/g, '[')
     .replace(/］/g, ']')
     .replace(/[０-９]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xff10 + 0x30));
+}
+
+/**
+ * Drop any `[n]` whose number does not name a source in THIS answer (n < 1 or n > count). A
+ * citation with no matching source is an invented citation — the contract forbids inventing one
+ * ("every [n] resolves to a retrieved source"), and a single dangling marker is an automatic fail
+ * in the grounding check. We remove the marker rather than renumber: there is no correct source to
+ * point a phantom `[5]` at, so the honest act is to un-cite that clause, not to fabricate a target.
+ */
+function dropUngroundedCitations(text: string, sourceCount: number): string {
+  return text.replace(/\[(\d{1,3})\]/g, (marker, digits) => {
+    const n = Number(digits);
+    return n >= 1 && n <= sourceCount ? marker : '';
+  });
+}
+
+/**
+ * A streaming-safe citation filter. The model streams tokens, so a `[12]` can arrive split across
+ * deltas ("[", "12", "]") — we cannot validate a number we have not fully seen. This holds back a
+ * trailing partial citation ("[" or "[12" awaiting its "]") until the closing bracket lands, then
+ * normalizes and drops any out-of-range `[n]` before the token reaches the SSE channel — so a
+ * dangling citation is never emitted, and a valid one streams with only a sub-token delay. Non-
+ * citation text (a stray "[") flushes immediately once it can no longer be a citation prefix.
+ */
+function makeCitationFilter(sourceCount: number, emit: (text: string) => void): {
+  push: (chunk: string) => void;
+  end: () => void;
+} {
+  let buf = '';
+  const flush = (text: string): void => {
+    const cleaned = dropUngroundedCitations(text, sourceCount);
+    if (cleaned) emit(cleaned);
+  };
+  return {
+    push(chunk: string): void {
+      // Accumulate then normalize the whole buffer, so a full-width bracket split across deltas
+      // (【 then 5】) still folds to ASCII before we look for a citation.
+      buf = normalizeCitations(buf + chunk);
+      // Hold back a trailing "[" optionally followed by up to 3 digits: it may still become a
+      // citation whose number we must validate. Anything before it is safe to emit now.
+      const partial = buf.match(/\[\d{0,3}$/);
+      const hold = partial ? partial[0] : '';
+      const ready = hold ? buf.slice(0, buf.length - hold.length) : buf;
+      buf = hold;
+      if (ready) flush(ready);
+    },
+    end(): void {
+      if (buf) {
+        flush(buf);
+        buf = '';
+      }
+    }
+  };
 }
 
 function finishDone(

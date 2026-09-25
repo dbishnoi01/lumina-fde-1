@@ -117,6 +117,20 @@ export function pickSnippet(text: string, query: string, len = 320): string {
       break;
     }
   }
-  const start = at === -1 ? 0 : Math.max(0, at - 60);
-  return text.slice(start, start + len).trim();
+  let start = at === -1 ? 0 : Math.max(0, at - 60);
+  let end = Math.min(text.length, start + len);
+  // Snap both ends to whole-word boundaries. The grounding check normalizes snippet and page
+  // and then looks for a 12-token CONTIGUOUS window; a truncated word at either edge is a token
+  // that does not exist in the page, which breaks that window (and, for a short passage that
+  // normalizes to <=12 tokens, the exact-string match), reading a genuinely-grounded citation
+  // as ungrounded. `at - 60` and `start + len` both land mid-word, so trim inward to real spaces.
+  if (start > 0) {
+    const sp = text.indexOf(' ', start);
+    if (sp !== -1 && sp < end) start = sp + 1;
+  }
+  if (end < text.length) {
+    const sp = text.lastIndexOf(' ', end);
+    if (sp > start) end = sp;
+  }
+  return text.slice(start, end).trim();
 }
