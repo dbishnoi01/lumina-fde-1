@@ -41,15 +41,14 @@ services:
 
       # ---- LLM provider ----
       # Primary is LLM_PROVIDER; the other provider is the fallback (only when
-      # LLM_FALLBACK_ENABLED and its key is set). We run Groq gpt-oss-120b as primary: it is
-      # ~10-20x faster per turn than Gemini flash-lite (~0.5s vs 6-10s), which the full bench
-      # NEEDS — 4 parallel slow Gemini research loops saturate the free container and the run
-      # dies on timeouts. Requires the Groq account on a PAID tier so the 200K-TPD/RPM free caps
-      # do not 429 mid-run (a deep query alone is token-heavy). Fallback stays OFF: a Groq→Gemini
-      # MIXED transcript hard-400s because Gemini 3.x demands a thought_signature on every tool
-      # call in the history, so on a Groq cap we fail loud rather than send unsigned calls to Gemini.
+      # LLM_FALLBACK_ENABLED and its key is set). We run Gemini flash-lite as primary on the
+      # PAID Gemini tier (no token cap, higher RPM). Fallback stays OFF: a Groq→Gemini MIXED
+      # transcript hard-400s because Gemini 3.x demands a thought_signature on every tool call
+      # in the history, so on an error we fail loud rather than send unsigned calls across.
+      # gpt-oss-120b on Groq (LLM_PROVIDER=groq) is faster per turn but its free tier's 200K-TPD
+      # cap can't complete a full bench; only switch to it on a PAID Groq tier.
       - key: LLM_PROVIDER
-        value: groq
+        value: gemini
       - key: LLM_FALLBACK_ENABLED
         value: "false"
       - key: GEMINI_CHAT_MODEL
