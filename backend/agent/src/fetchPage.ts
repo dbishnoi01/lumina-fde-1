@@ -73,10 +73,13 @@ export async function fetchPage(url: string): Promise<FetchedPage> {
     redirect: 'follow',
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     headers: {
-      // A bare fetch is 403'd by many publishers; a normal UA gets the article.
-      'user-agent':
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36',
-      accept: 'text/html,application/xhtml+xml'
+      // Read the page as the SAME client the grounding check uses. The bench proves a citation
+      // by re-fetching the url with this exact UA and no Accept header, then looking for our
+      // snippet in that body. A Chrome UA gets us a richer article, but UA-gated sites (bot
+      // walls, consent interstitials) then serve the bench a DIFFERENT page, so our honest quote
+      // is absent from its copy and a real citation reads as ungrounded. Matching the bench's
+      // request makes "what we cite" identical to "what a re-fetch sees" by construction.
+      'user-agent': 'lumina-bench/0.1 (+course benchmark)'
     }
   });
   if (!res.ok) throw new Error(`fetch ${res.status} for ${url}`);

@@ -262,7 +262,10 @@ export async function chat(
       model: b.model,
       messages,
       ...(tools.length > 0 ? { tools: toOpenAiTools(tools), tool_choice: toolChoice } : {}),
-      temperature: 0.2,
+      // temperature 0: the tool-calling turn decides web_search args, and the search cache is keyed
+      // on that string. Deterministic reformulation means an identical question reproduces an
+      // identical query → cache hit. (Synthesis stays at 0.2 for prose variety; it never keys the cache.)
+      temperature: 0,
       stream: false
     })
   );

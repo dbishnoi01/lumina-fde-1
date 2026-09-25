@@ -197,7 +197,7 @@ function researchSystem(mode: AskMode, hasSpace: boolean): string {
   ];
   if (webAvailable)
     lines.push(
-      '- For a web question: run at most one or two web_search calls, then fetch_page the 1–3 most relevant results (you may request several fetch_page calls at once). Only a fetched page can be cited — never rely on a search snippet.'
+      '- For a web question: run exactly one web_search call, then fetch_page the 1–3 most relevant results (you may request several fetch_page calls at once). Only a fetched page can be cited — never rely on a search snippet.'
     );
   if (docsAvailable)
     lines.push('- For a documents question: use search_documents over the current Space, and cite passages by their page locator.');
@@ -287,6 +287,8 @@ export async function runAsk(params: AskParams): Promise<void> {
     query: params.query,
     tally,
     candidates,
+    taskQuery: params.query,
+    searchCountInTask: 0,
     lastSearchHits: [],
     fetched: new Set<string>()
   };
