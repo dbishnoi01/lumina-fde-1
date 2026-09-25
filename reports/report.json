@@ -1,0 +1,453 @@
+{
+  "assignment": "Assignment 1: LUMINA",
+  "student": "Dhruv Deep Bishnoi",
+  "deployedAt": "2026-09-25T03:57:19.151Z",
+  "runNotes": "gemini-3.5-flash-lite · tavily · Atlas M0 · single Render free container (gateway loopback→agent + worker)",
+  "design": {
+    "components": "Five pieces, in three runtimes.\n\n1. **Web UI** — the provided React 18 + Vite SPA, deployed to **Vercel**. It only ever\n   holds a public gateway URL (`VITE_API_URL`); no key or provider name is baked in.\n2. **Gateway** — an Express service that is the *only* thing the browser reaches. Binds\n   `0.0.0.0:$PORT`. Holds no provider keys.\n3. **Agent service** — an Express service that runs the agent loop, both gears, all six\n   tools, memory, RAG retrieval, and deep search. Binds `127.0.0.1:8000` (loopback).\n   Holds every provider key.\n4. **Jobs worker** — a background polling loop (same container, no HTTP port) that turns\n   an uploaded document into indexed, searchable chunks. Runs off the request path.\n5. **MongoDB Atlas (M0)** — one cluster that is the whole persistence layer: authoritative\n   state (`threads`, `messages`, `memories`, `spaces`, `documents`, `chunks`, `jobs`,\n   `requests`, `runs`), the disposable `searchCache` (TTL), the two vector indexes and one\n   text index, and GridFS for raw uploads.\n\nThe gateway, agent, and worker run as **three processes inside one Render free-tier\ncontainer**, started by a small supervisor (`render-start.mjs`). Render exposes only\n`$PORT`, so only the gateway is publicly routable. The non-service state that still makes\ndecisions: `jobs` (the worker's queue), `searchCache` (whether a search is free), and\n`runs/*.json` (what the grading gates read).",
+    "responsibilities": "The interesting rules are the exclusions.\n\n- **Gateway — the only browser-facing edge, and a mirror not an interpreter.** It is the\n  only component allowed to accept a cross-origin request, enforce `X-User-Id` (401\n  without it), validate bodies against the `@lumina/contract` zod schemas (400), rate-limit\n  per user (429), assign/propagate `X-Request-Id`, and stream SSE back unbuffered. It\n  forwards the agent's status and body **verbatim** — a 429/404/413/502 from the agent\n  survives intact. It may **not** hold a provider key, call an LLM, or decide anything\n  about the answer. If the agent is unreachable it returns 502, never a plausible 2xx.\n- **Agent — the only holder of keys and the only enforcer of spend.** It is the only\n  component that reads `ANTHROPIC_API_KEY`/`GROQ_API_KEY`/`GEMINI_API_KEY`/`TAVILY_API_KEY`,\n  the only one that talks to Groq / Gemini / Tavily, and the **only** enforcer of the loop\n  caps and the `DEEP_DAILY_CAP` (deep 5/user/day → 429). It decides retrieval routing\n  (`auto|web|docs`), guarantees grounding (every `[n]` resolves to something fetched in\n  *this* request), and reports termination honestly (`done|cap|error`). A quick search may\n  never reach `plan_research` — the tool list is filtered by depth *before* the first model\n  call, not by a prompt asking nicely.\n- **Worker — the only writer of chunk embeddings.** It is the only component allowed to\n  parse a PDF and write to `chunks`, and the only one that flips a document to `indexed` —\n  and only after a read-your-write probe proves the chunk is searchable.\n- **Atlas — the only durable store.** Nothing is \"remembered\" that a query against Atlas\n  would not return.",
+    "communication": "- **Browser → Gateway: HTTPS + SSE.** Regular JSON for most routes; for\n  `POST /threads/:id/ask` the gateway streams `text/event-stream` with `X-Accel-Buffering:\n  no` and a flush per frame so time-to-first-token survives the hop. If the gateway is\n  down the browser shows a network error; there is nothing to fake.\n- **Gateway → Agent: HTTP + SSE over loopback (`127.0.0.1:8000`).** Same contract; the\n  gateway pipes the agent's SSE bytes straight through. If the agent is down or throws, the\n  gateway surfaces 502 and the in-flight `ask` stream ends as an `error` event — never a\n  truncated answer dressed as success.\n- **Agent → Worker: a Mongo collection, not a call.** The agent inserts a `pending` row\n  into `jobs` and returns `202` immediately; the worker polls, claims atomically\n  (`findOneAndUpdate` on `status:'pending'`), and does the work. Decoupling by a collection\n  means an upload can never block an answer stream, and a worker crash just leaves a\n  claimed row for the stale-claim sweeper to reset — the request already succeeded.\n- **Everything → Atlas: the MongoDB driver**, one pooled client per process. If Atlas is\n  unreachable, `/health` reports `db: down` and the bench refuses to measure.",
+    "state": "- **Authoritative (in Atlas):** `threads`, `messages` (thread history), `memories`\n  (durable facts + their embedding), `spaces`, `documents` (ingest status), `chunks` (text\n  + locator + embedding), `jobs` (the queue), `requests` and `runs` (observability). GridFS\n  holds the raw upload. `userId` (from `X-User-Id`) owns every row.\n- **Cache (disposable):** `searchCache` — keyed by `sha256(normalized query + provider)`,\n  expired by a TTL index, fronted by a per-process in-memory LRU. Deleting all of it costs\n  nothing but a few repeated Tavily calls; `searchCached` in the `done` event is only true\n  when *every* search in the request was a hit.\n- **Consistency for \"written but not yet searchable\":** Atlas Search indexes are eventually\n  consistent, so an upserted chunk is not immediately returned by `$vectorSearch`. The\n  worker therefore does not trust the write — it runs a read-your-write probe (query the\n  vector index for a chunk it just wrote) and only flips the document to `indexed` once the\n  probe returns it. That is the whole reason `indexed` is a distinct status from `embedding`.",
+    "tradeoffs": "- **One Render container instead of two isolated services (Fly private networking).** The\n  PRD's stated reason for two services is independent deploy and failure. I kept the\n  *logical* split (gateway/agent/worker as separate processes, keys only in the agent, agent\n  on loopback) but gave up physical isolation to stay on a genuinely free tier. What I lose:\n  a crash in one process restarts all three, and I can't scale them independently. Given a\n  two-week single-user assignment, that trade is worth $0/month; for production it would not\n  be. **This is the decision I'm least sure about** — Render's cold-start on idle is a real\n  risk to the TTFT p95 gate, and I'm mitigating it only by warming the container before the\n  eval run rather than paying for always-on.\n- **Groq (Llama 3.3 70B) instead of Claude Sonnet 5.** I gave up some answer quality and the\n  \"deep is clearly better\" human gate gets harder, in exchange for a free tier and much\n  faster tokens (which *helps* the TTFT and full-answer SLAs). The provider is swappable\n  behind one interface, so if quality costs me the human gate I can point `LLM_PROVIDER` at\n  Anthropic without touching the loop.\n- **Gemini `gemini-embedding-001` at 1536-d instead of OpenAI `text-embedding-3-small`.**\n  Same dimension so the Atlas index is unchanged; I gave up the marginally better-documented\n  OpenAI model for a free tier, and took on Gemini's rate limits (which force me to batch and\n  pace ingestion).\n- **Atlas Vector Search instead of a dedicated vector store (Qdrant/pgvector).** One document\n  per citation — the chunk text, its page locator, and its embedding live together, so a\n  citation is one read and `spaceId` is a plain filter inside `$vectorSearch`. The cost is\n  the M0 three-index ceiling: exactly 2 vector + 1 text, none to spare, so hybrid retrieval\n  has to fit in that budget."
+  },
+  "gates": [
+    {
+      "gate": 0,
+      "name": "STATIC",
+      "status": "pass",
+      "detail": "lint, typecheck and git clean"
+    },
+    {
+      "gate": 1,
+      "name": "CONTRACT",
+      "status": "pass",
+      "detail": "C1: expectations.json is coherent",
+      "exitCode": 2
+    },
+    {
+      "gate": 2,
+      "name": "RUN",
+      "status": "fail",
+      "detail": "the smoke run missed a target — see above",
+      "exitCode": 1
+    }
+  ],
+  "rubric": {
+    "total": 100,
+    "awarded": 51,
+    "automated": [
+      {
+        "id": "ui_lights_up_contract",
+        "label": "UI lights up & contract",
+        "points": 10,
+        "awarded": 10,
+        "status": "pass",
+        "evidence": "✓ contract probes (401/404/400): GET /memory without X-User-Id: 401 · GET /threads/thr_nope (unknown id): 404 · POST /threads/thr_x/ask with an empty body: 400 · GET /evals/report.json without X-User-Id: 404 · ✓ sources before the first token: every answer sent its sources event before its first token · ✓ /health names model, provider, store: /health names gemini-3.5-flash-lite · tavily · atlas-vector-search · db ok",
+        "rules": [
+          "C1"
+        ]
+      },
+      {
+        "id": "search_cited_answers",
+        "label": "Search & cited answers",
+        "points": 20,
+        "awarded": 7,
+        "status": "partial",
+        "evidence": "✗ citation grounding >= 0.95: citation grounding 0.8 over 85 verifiable citations, 0 dangling · ✗ search cache hits on repeats: search cache hit rate 12.5% on a workload that is 50% repeats",
+        "rules": [
+          "E2"
+        ]
+      },
+      {
+        "id": "memory",
+        "label": "Memory (thread + long-term)",
+        "points": 10,
+        "awarded": 7,
+        "status": "partial",
+        "evidence": "✗ recall crosses into a new thread: a new thread never called recall_memory — the preference cannot have crossed threads",
+        "rules": []
+      },
+      {
+        "id": "rag_documents",
+        "label": "RAG over documents",
+        "points": 15,
+        "awarded": 9,
+        "status": "partial",
+        "evidence": "✗ 202 accept p95 < 300ms: 202 accept p95 2834ms · ✗ mode=auto picks documents: mode=auto never touched the Space on a corpus question",
+        "rules": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "id": "deep_search",
+        "label": "Deep search (plan, fan-out, merged citations, spend gate)",
+        "points": 15,
+        "awarded": 13,
+        "status": "partial",
+        "evidence": "✗ deep cap+1 returns 429 with resetsAt: deep cap probe failed: 520: <!DOCTYPE html>\n<!--[if lt IE 7]> <html class=\"no-js ie6 oldie\" lang=\"en-US\"> <![endif]-->\n<!--[if IE 7]>    <html class=\"no-js ie7 oldie\" lang=\"en-US\"> <![endif]-->\n<!--[if IE 8]>    <html class=\"no-",
+        "rules": [
+          "E2",
+          "B3",
+          "R2"
+        ]
+      },
+      {
+        "id": "performance_sla",
+        "label": "Performance & SLA gate",
+        "points": 10,
+        "awarded": 0,
+        "status": "fail",
+        "evidence": "✗ bench.mjs exits 0: 8 SLA target(s) missed · ✗ the quick gear stayed in its own envelope: 4/75 quick run(s) exceeded $0.05 or 8 tool calls · ✗ no error-severity quality failure: quality: 1 error(s), 2 warning(s) over 65 run log(s)",
+        "rules": [
+          "B1",
+          "B2",
+          "B3",
+          "A2",
+          "A3"
+        ]
+      },
+      {
+        "id": "observability",
+        "label": "Logging, tracing & stats",
+        "points": 5,
+        "awarded": 5,
+        "status": "pass",
+        "evidence": "✓ one X-Request-Id correlates both logs: 71/71 answers returned an X-Request-Id to correlate the two logs · ✓ /stats reconciles with the run: /stats.answers=216 against 71 answers this run · ✓ every failed tool call carries an error (A1): A1: 65 run(s)",
+        "rules": [
+          "A1"
+        ]
+      }
+    ],
+    "manual": [
+      {
+        "id": "deep_search_quality",
+        "label": "Deep search quality (human half)",
+        "points": 5,
+        "awarded": 0,
+        "status": "manual",
+        "evidence": "a grader asks the same question at both depths and reads both answers. The deep one has to be BETTER, not merely longer: broader coverage, sources the quick answer missed, sub-questions a person would actually have asked, and no padding. Judged by a person, never a model",
+        "rules": [
+          "E3",
+          "P1"
+        ]
+      },
+      {
+        "id": "human_gate_answer_quality",
+        "label": "Human gate & answer quality",
+        "points": 5,
+        "awarded": 0,
+        "status": "manual",
+        "evidence": "/evals renders one successful and one failing trajectory in full, every step, with what each taught the learner; grader reads five sampled answers for concision, relevance, and honesty when retrieval is thin",
+        "rules": [
+          "P1"
+        ]
+      },
+      {
+        "id": "deploy_docs",
+        "label": "Deploy & docs",
+        "points": 5,
+        "awarded": 0,
+        "status": "manual",
+        "evidence": "UI deployed on Vercel (the submitted URL) with /evals rendering GET /evals/report.json from this run; services on Fly.io or Vercel against an Atlas cluster; agent service not publicly reachable; no key or connection string reachable from the browser; the design section (five questions) and run notes render on the page",
+        "rules": []
+      }
+    ],
+    "redLines": [
+      {
+        "check": "no fabricated citation in the bench sample (E2)",
+        "ok": true,
+        "detail": "0 citation(s) resolved to nothing retrieved in that request"
+      },
+      {
+        "check": "no run that hit a cap reported as terminated=done (A2)",
+        "ok": true,
+        "detail": "65 run(s)"
+      },
+      {
+        "check": "plan_research never called from a quick search: depth is opted into, never drifted into (R2)",
+        "ok": true,
+        "detail": "75 quick run(s), none called plan_research"
+      },
+      {
+        "check": "no 2xx answer served on a provider exception (A1)",
+        "ok": true,
+        "detail": "65 run(s)"
+      }
+    ]
+  },
+  "bench": {
+    "ranAt": "2026-09-25T03:50:52.633Z",
+    "target": "https://lumina-backend-k4ub.onrender.com",
+    "pass": false,
+    "sla": [
+      {
+        "metric": "ttft p95",
+        "target": 2500,
+        "actual": 29154,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "answer p95",
+        "target": 12000,
+        "actual": 30212,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "202 accept p95",
+        "target": 300,
+        "actual": 2834,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "search p95 during ingest / idle",
+        "target": 1.3,
+        "actual": 3.487,
+        "unit": "×",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "recall@5",
+        "target": 0.7,
+        "actual": 0.9,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "search cache hit rate",
+        "target": 50,
+        "actual": 12.5,
+        "unit": "%",
+        "comparator": ">=",
+        "pass": false
+      },
+      {
+        "metric": "deep plan p95",
+        "target": 4000,
+        "actual": 28344,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "deep answer p95",
+        "target": 90,
+        "actual": 117,
+        "unit": "s",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "deep sub-questions (min)",
+        "target": 3,
+        "actual": 3,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "deep/quick source ratio (min)",
+        "target": 2,
+        "actual": 3,
+        "unit": "×",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "cost per deep answer",
+        "target": 0.35,
+        "actual": 0.244,
+        "unit": "$",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "citation grounding",
+        "target": 0.95,
+        "actual": 0.8,
+        "unit": "",
+        "comparator": ">=",
+        "pass": false
+      },
+      {
+        "metric": "error rate",
+        "target": 0.01,
+        "actual": 0,
+        "unit": "",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "cost per answer (quick)",
+        "target": 0.05,
+        "actual": 0.0296,
+        "unit": "$",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "sources before the first token",
+        "target": 1,
+        "actual": 1,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "citations with no matching source",
+        "target": 0,
+        "actual": 0,
+        "unit": "",
+        "comparator": "<=",
+        "pass": true
+      }
+    ],
+    "citationGrounding": 0.8,
+    "recallAt5": 0.9,
+    "retrievalRate": 1,
+    "errorRate": 0,
+    "latency": {
+      "ttftP50Ms": 9753,
+      "ttftP95Ms": 29154,
+      "answerP50Ms": 10908,
+      "answerP95Ms": 30212,
+      "accept202P95Ms": 2834
+    },
+    "cost": {
+      "meanCostPerAnswerUsd": 0.029554533333333334,
+      "meanCostPerDeepAnswerUsd": 0.2440365,
+      "declaredPriceTableUsd": 0.0330219746835443,
+      "projectedMonthlyUsd": 5100.272999999999,
+      "projectedMonthlyNoCacheUsd": 3055.4533333333334
+    },
+    "searchCacheHitRatePct": 12.5,
+    "answers": 79
+  },
+  "quality": {
+    "project": "Assignment_1_Lumina",
+    "checkedAt": "2026-09-25T03:56:34.192Z",
+    "runs": 65,
+    "errors": 1,
+    "warnings": 2,
+    "results": [
+      {
+        "id": "C1",
+        "title": "Declared expectations are internally coherent",
+        "severity": "error",
+        "status": "pass",
+        "detail": "contract coherent"
+      },
+      {
+        "id": "A1",
+        "title": "Tool errors surface as errors",
+        "severity": "error",
+        "status": "pass",
+        "detail": "65 run(s)"
+      },
+      {
+        "id": "A2",
+        "title": "The loop terminates because it finished",
+        "severity": "error",
+        "status": "pass",
+        "detail": "65 run(s)"
+      },
+      {
+        "id": "A3",
+        "title": "No tool thrash",
+        "severity": "warn",
+        "status": "pass",
+        "detail": "65 run(s)"
+      },
+      {
+        "id": "R1",
+        "title": "Required tools were actually called",
+        "severity": "error",
+        "status": "skip",
+        "detail": "none declared"
+      },
+      {
+        "id": "R2",
+        "title": "Forbidden tools were not called",
+        "severity": "error",
+        "status": "skip",
+        "detail": "none declared"
+      },
+      {
+        "id": "E1",
+        "title": "A gold set exists and is non-trivial",
+        "severity": "error",
+        "status": "pass",
+        "detail": "39 items"
+      },
+      {
+        "id": "E2",
+        "title": "Declared eval thresholds are met",
+        "severity": "error",
+        "status": "fail",
+        "detail": "citationGrounding=0.8 < 0.95"
+      },
+      {
+        "id": "E3",
+        "title": "A judge model may report, never block",
+        "severity": "warn",
+        "status": "manual",
+        "detail": "confirm no error-severity rule derives its verdict from a model"
+      },
+      {
+        "id": "B1",
+        "title": "Token budget respected",
+        "severity": "error",
+        "status": "pass",
+        "detail": "65 run(s)"
+      },
+      {
+        "id": "B2",
+        "title": "Latency budget respected",
+        "severity": "warn",
+        "status": "fail",
+        "detail": "req_3e78a56d-3c2: 240.288s > 240s"
+      },
+      {
+        "id": "B3",
+        "title": "Cost budget respected",
+        "severity": "warn",
+        "status": "pass",
+        "detail": "65 run(s)"
+      },
+      {
+        "id": "P1",
+        "title": "A human read a full trajectory",
+        "severity": "info",
+        "status": "manual",
+        "detail": "name the successful and failing trajectories you read end to end"
+      },
+      {
+        "id": "P2",
+        "title": "Every rule cites a real precedent",
+        "severity": "warn",
+        "status": "fail",
+        "detail": "10 rule(s) still lack a real precedent: C1, A2, A3, R1, R2, E1, E2, B1, B2, B3"
+      }
+    ]
+  },
+  "trajectories": {
+    "successful": {
+      "requestId": "MISSING-successful",
+      "steps": [],
+      "notes": "MISSING — pass --successful <requestId> naming a run log in runs/ (or runs/failing/). Rule P1 is the human gate: you read one successful and one failing trajectory, every step, and say what each taught you. It cannot be automated and cannot be skipped."
+    },
+    "failing": {
+      "requestId": "MISSING-failing",
+      "steps": [],
+      "notes": "MISSING — pass --failing <requestId> naming a run log in runs/ (or runs/failing/). Rule P1 is the human gate: you read one successful and one failing trajectory, every step, and say what each taught you. It cannot be automated and cannot be skipped."
+    }
+  }
+}
