@@ -1,7 +1,8 @@
 {
   "assignment": "Assignment 1: LUMINA",
   "student": "Dhruv Deep Bishnoi",
-  "deployedAt": "2026-09-25T12:13:06.667Z",
+  "video": "https://youtu.be/Lct8RaIe9aA",
+  "deployedAt": "2026-09-25T15:27:04.635Z",
   "runNotes": "gemini-3.5-flash-lite · tavily · Atlas M0 · single Render free container (gateway loopback→agent + worker)",
   "design": {
     "components": "Five pieces, in three runtimes.\n\n1. **Web UI** — the provided React 18 + Vite SPA, deployed to **Vercel**. It only ever\n  holds a public gateway URL (`VITE_API_URL`); no key or provider name is baked in.\n2. **Gateway** — an Express service that is the *only* thing the browser reaches. Binds\n  `0.0.0.0:$PORT`. Holds no provider keys.\n3. **Agent service** — an Express service that runs the agent loop, both gears, all six\n  tools, memory, RAG retrieval, and deep search. Binds `127.0.0.1:8000` (loopback).\n   Holds every provider key.\n4. **Jobs worker** — a background polling loop (same container, no HTTP port) that turns\n  an uploaded document into indexed, searchable chunks. Runs off the request path.\n5. **MongoDB Atlas (M0)** — one cluster that is the whole persistence layer: authoritative\n  state (`threads`, `messages`, `memories`, `spaces`, `documents`, `chunks`, `jobs`,\n   `requests`, `runs`), the disposable `searchCache` (TTL), the two vector indexes and one\n   text index, and GridFS for raw uploads.\n\nThe gateway, agent, and worker run as **three processes inside one Render free-tier\ncontainer**, started by a small supervisor (`render-start.mjs`). Render exposes only\n`$PORT`, so only the gateway is publicly routable. The non-service state that still makes\ndecisions: `jobs` (the worker's queue), `searchCache` (whether a search is free), and\n`runs/*.json` (what the grading gates read).",
