@@ -86,8 +86,12 @@ services:
         value: "6"
       - key: DEEP_DAILY_CAP
         value: "5"
+      # Quick tool-call ceiling. The spec allows up to 8 (bench.mjs asserts quick runs do not
+      # EXCEED 8); we hold it at 4 so a quick answer is ~half the Gemini turns → light enough that
+      # the free Render box (~0.1 vCPU) survives the bench's concurrency-4 workload without timing
+      # out. 4 covers search→fetch→converge; deep is unaffected (MAX_TOOL_CALLS_DEEP stays 24).
       - key: MAX_TOOL_CALLS
-        value: "8"
+        value: "4"
       - key: MAX_WALL_CLOCK_SEC
         value: "90"
       - key: MAX_TOOL_CALLS_DEEP
