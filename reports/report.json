@@ -1,14 +1,14 @@
 {
   "assignment": "Assignment 1: LUMINA",
   "student": "Dhruv Deep Bishnoi",
-  "deployedAt": "2026-09-25T03:57:19.151Z",
+  "deployedAt": "2026-09-25T07:23:58.223Z",
   "runNotes": "gemini-3.5-flash-lite · tavily · Atlas M0 · single Render free container (gateway loopback→agent + worker)",
   "design": {
-    "components": "Five pieces, in three runtimes.\n\n1. **Web UI** — the provided React 18 + Vite SPA, deployed to **Vercel**. It only ever\n   holds a public gateway URL (`VITE_API_URL`); no key or provider name is baked in.\n2. **Gateway** — an Express service that is the *only* thing the browser reaches. Binds\n   `0.0.0.0:$PORT`. Holds no provider keys.\n3. **Agent service** — an Express service that runs the agent loop, both gears, all six\n   tools, memory, RAG retrieval, and deep search. Binds `127.0.0.1:8000` (loopback).\n   Holds every provider key.\n4. **Jobs worker** — a background polling loop (same container, no HTTP port) that turns\n   an uploaded document into indexed, searchable chunks. Runs off the request path.\n5. **MongoDB Atlas (M0)** — one cluster that is the whole persistence layer: authoritative\n   state (`threads`, `messages`, `memories`, `spaces`, `documents`, `chunks`, `jobs`,\n   `requests`, `runs`), the disposable `searchCache` (TTL), the two vector indexes and one\n   text index, and GridFS for raw uploads.\n\nThe gateway, agent, and worker run as **three processes inside one Render free-tier\ncontainer**, started by a small supervisor (`render-start.mjs`). Render exposes only\n`$PORT`, so only the gateway is publicly routable. The non-service state that still makes\ndecisions: `jobs` (the worker's queue), `searchCache` (whether a search is free), and\n`runs/*.json` (what the grading gates read).",
-    "responsibilities": "The interesting rules are the exclusions.\n\n- **Gateway — the only browser-facing edge, and a mirror not an interpreter.** It is the\n  only component allowed to accept a cross-origin request, enforce `X-User-Id` (401\n  without it), validate bodies against the `@lumina/contract` zod schemas (400), rate-limit\n  per user (429), assign/propagate `X-Request-Id`, and stream SSE back unbuffered. It\n  forwards the agent's status and body **verbatim** — a 429/404/413/502 from the agent\n  survives intact. It may **not** hold a provider key, call an LLM, or decide anything\n  about the answer. If the agent is unreachable it returns 502, never a plausible 2xx.\n- **Agent — the only holder of keys and the only enforcer of spend.** It is the only\n  component that reads `ANTHROPIC_API_KEY`/`GROQ_API_KEY`/`GEMINI_API_KEY`/`TAVILY_API_KEY`,\n  the only one that talks to Groq / Gemini / Tavily, and the **only** enforcer of the loop\n  caps and the `DEEP_DAILY_CAP` (deep 5/user/day → 429). It decides retrieval routing\n  (`auto|web|docs`), guarantees grounding (every `[n]` resolves to something fetched in\n  *this* request), and reports termination honestly (`done|cap|error`). A quick search may\n  never reach `plan_research` — the tool list is filtered by depth *before* the first model\n  call, not by a prompt asking nicely.\n- **Worker — the only writer of chunk embeddings.** It is the only component allowed to\n  parse a PDF and write to `chunks`, and the only one that flips a document to `indexed` —\n  and only after a read-your-write probe proves the chunk is searchable.\n- **Atlas — the only durable store.** Nothing is \"remembered\" that a query against Atlas\n  would not return.",
-    "communication": "- **Browser → Gateway: HTTPS + SSE.** Regular JSON for most routes; for\n  `POST /threads/:id/ask` the gateway streams `text/event-stream` with `X-Accel-Buffering:\n  no` and a flush per frame so time-to-first-token survives the hop. If the gateway is\n  down the browser shows a network error; there is nothing to fake.\n- **Gateway → Agent: HTTP + SSE over loopback (`127.0.0.1:8000`).** Same contract; the\n  gateway pipes the agent's SSE bytes straight through. If the agent is down or throws, the\n  gateway surfaces 502 and the in-flight `ask` stream ends as an `error` event — never a\n  truncated answer dressed as success.\n- **Agent → Worker: a Mongo collection, not a call.** The agent inserts a `pending` row\n  into `jobs` and returns `202` immediately; the worker polls, claims atomically\n  (`findOneAndUpdate` on `status:'pending'`), and does the work. Decoupling by a collection\n  means an upload can never block an answer stream, and a worker crash just leaves a\n  claimed row for the stale-claim sweeper to reset — the request already succeeded.\n- **Everything → Atlas: the MongoDB driver**, one pooled client per process. If Atlas is\n  unreachable, `/health` reports `db: down` and the bench refuses to measure.",
-    "state": "- **Authoritative (in Atlas):** `threads`, `messages` (thread history), `memories`\n  (durable facts + their embedding), `spaces`, `documents` (ingest status), `chunks` (text\n  + locator + embedding), `jobs` (the queue), `requests` and `runs` (observability). GridFS\n  holds the raw upload. `userId` (from `X-User-Id`) owns every row.\n- **Cache (disposable):** `searchCache` — keyed by `sha256(normalized query + provider)`,\n  expired by a TTL index, fronted by a per-process in-memory LRU. Deleting all of it costs\n  nothing but a few repeated Tavily calls; `searchCached` in the `done` event is only true\n  when *every* search in the request was a hit.\n- **Consistency for \"written but not yet searchable\":** Atlas Search indexes are eventually\n  consistent, so an upserted chunk is not immediately returned by `$vectorSearch`. The\n  worker therefore does not trust the write — it runs a read-your-write probe (query the\n  vector index for a chunk it just wrote) and only flips the document to `indexed` once the\n  probe returns it. That is the whole reason `indexed` is a distinct status from `embedding`.",
-    "tradeoffs": "- **One Render container instead of two isolated services (Fly private networking).** The\n  PRD's stated reason for two services is independent deploy and failure. I kept the\n  *logical* split (gateway/agent/worker as separate processes, keys only in the agent, agent\n  on loopback) but gave up physical isolation to stay on a genuinely free tier. What I lose:\n  a crash in one process restarts all three, and I can't scale them independently. Given a\n  two-week single-user assignment, that trade is worth $0/month; for production it would not\n  be. **This is the decision I'm least sure about** — Render's cold-start on idle is a real\n  risk to the TTFT p95 gate, and I'm mitigating it only by warming the container before the\n  eval run rather than paying for always-on.\n- **Groq (Llama 3.3 70B) instead of Claude Sonnet 5.** I gave up some answer quality and the\n  \"deep is clearly better\" human gate gets harder, in exchange for a free tier and much\n  faster tokens (which *helps* the TTFT and full-answer SLAs). The provider is swappable\n  behind one interface, so if quality costs me the human gate I can point `LLM_PROVIDER` at\n  Anthropic without touching the loop.\n- **Gemini `gemini-embedding-001` at 1536-d instead of OpenAI `text-embedding-3-small`.**\n  Same dimension so the Atlas index is unchanged; I gave up the marginally better-documented\n  OpenAI model for a free tier, and took on Gemini's rate limits (which force me to batch and\n  pace ingestion).\n- **Atlas Vector Search instead of a dedicated vector store (Qdrant/pgvector).** One document\n  per citation — the chunk text, its page locator, and its embedding live together, so a\n  citation is one read and `spaceId` is a plain filter inside `$vectorSearch`. The cost is\n  the M0 three-index ceiling: exactly 2 vector + 1 text, none to spare, so hybrid retrieval\n  has to fit in that budget."
+    "components": "Five pieces, in three runtimes.\n\n1. **Web UI** — the provided React 18 + Vite SPA, deployed to **Vercel**. It only ever\n  holds a public gateway URL (`VITE_API_URL`); no key or provider name is baked in.\n2. **Gateway** — an Express service that is the *only* thing the browser reaches. Binds\n  `0.0.0.0:$PORT`. Holds no provider keys.\n3. **Agent service** — an Express service that runs the agent loop, both gears, all six\n  tools, memory, RAG retrieval, and deep search. Binds `127.0.0.1:8000` (loopback).\n   Holds every provider key.\n4. **Jobs worker** — a background polling loop (same container, no HTTP port) that turns\n  an uploaded document into indexed, searchable chunks. Runs off the request path.\n5. **MongoDB Atlas (M0)** — one cluster that is the whole persistence layer: authoritative\n  state (`threads`, `messages`, `memories`, `spaces`, `documents`, `chunks`, `jobs`,\n   `requests`, `runs`), the disposable `searchCache` (TTL), the two vector indexes and one\n   text index, and GridFS for raw uploads.\n\nThe gateway, agent, and worker run as **three processes inside one Render free-tier\ncontainer**, started by a small supervisor (`render-start.mjs`). Render exposes only\n`$PORT`, so only the gateway is publicly routable. The non-service state that still makes\ndecisions: `jobs` (the worker's queue), `searchCache` (whether a search is free), and\n`runs/*.json` (what the grading gates read).",
+    "responsibilities": "The interesting rules are the exclusions.\n\n- **Gateway — the only browser-facing edge, and a mirror not an interpreter.** It is the\nonly component allowed to accept a cross-origin request, enforce `X-User-Id` (401\nwithout it), validate bodies against the `@lumina/contract` zod schemas (400), rate-limit\nper user (429), assign/propagate `X-Request-Id`, and stream SSE back unbuffered. It\nforwards the agent's status and body **verbatim** — a 429/404/413/502 from the agent\nsurvives intact. It may **not** hold a provider key, call an LLM, or decide anything\nabout the answer. If the agent is unreachable it returns 502, never a plausible 2xx.\n- **Agent — the only holder of keys and the only enforcer of spend.** It is the only\ncomponent that reads `ANTHROPIC_API_KEY`/`GROQ_API_KEY`/`GEMINI_API_KEY`/`TAVILY_API_KEY`,\nthe only one that talks to Groq / Gemini / Tavily, and the **only** enforcer of the loop\ncaps and the `DEEP_DAILY_CAP` (deep 5/user/day → 429). It decides retrieval routing\n(`auto|web|docs`), guarantees grounding (every `[n]` resolves to something fetched in\n*this* request), and reports termination honestly (`done|cap|error`). A quick search may\nnever reach `plan_research` — the tool list is filtered by depth *before* the first model\ncall, not by a prompt asking nicely.\n- **Worker — the only writer of chunk embeddings.** It is the only component allowed to\nparse a PDF and write to `chunks`, and the only one that flips a document to `indexed` —\nand only after a read-your-write probe proves the chunk is searchable.\n- **Atlas — the only durable store.** Nothing is \"remembered\" that a query against Atlas\nwould not return.",
+    "communication": "- **Browser → Gateway: HTTPS + SSE.** Regular JSON for most routes; for\n`POST /threads/:id/ask` the gateway streams `text/event-stream` with `X-Accel-Buffering: no` and a flush per frame so time-to-first-token survives the hop. If the gateway is\ndown the browser shows a network error; there is nothing to fake.\n- **Gateway → Agent: HTTP + SSE over loopback (**`127.0.0.1:8000`**).** Same contract; the\ngateway pipes the agent's SSE bytes straight through. If the agent is down or throws, the\ngateway surfaces 502 and the in-flight `ask` stream ends as an `error` event — never a\ntruncated answer dressed as success.\n- **Agent → Worker: a Mongo collection, not a call.** The agent inserts a `pending` row\ninto `jobs` and returns `202` immediately; the worker polls, claims atomically\n(`findOneAndUpdate` on `status:'pending'`), and does the work. Decoupling by a collection\nmeans an upload can never block an answer stream, and a worker crash just leaves a\nclaimed row for the stale-claim sweeper to reset — the request already succeeded.\n- **Everything → Atlas: the MongoDB driver**, one pooled client per process. If Atlas is\nunreachable, `/health` reports `db: down` and the bench refuses to measure.",
+    "state": "- **Authoritative (in Atlas):** `threads`, `messages` (thread history), `memories`\n(durable facts + their embedding), `spaces`, `documents` (ingest status), `chunks` (text\n  - locator + embedding), `jobs` (the queue), `requests` and `runs` (observability). GridFS\n  holds the raw upload. `userId` (from `X-User-Id`) owns every row.\n- **Cache (disposable):** `searchCache` — keyed by `sha256(normalized query + provider)`,\nexpired by a TTL index, fronted by a per-process in-memory LRU. Deleting all of it costs\nnothing but a few repeated Tavily calls; `searchCached` in the `done` event is only true\nwhen *every* search in the request was a hit.\n- **Consistency for \"written but not yet searchable\":** Atlas Search indexes are eventually\nconsistent, so an upserted chunk is not immediately returned by `$vectorSearch`. The\nworker therefore does not trust the write — it runs a read-your-write probe (query the\nvector index for a chunk it just wrote) and only flips the document to `indexed` once the\nprobe returns it. That is the whole reason `indexed` is a distinct status from `embedding`.",
+    "tradeoffs": "- **One Render container instead of two isolated services (Fly private networking).** The\nPRD's stated reason for two services is independent deploy and failure. I kept the\n*logical* split (gateway/agent/worker as separate processes, keys only in the agent, agent\non loopback) but gave up physical isolation to stay on a genuinely free tier. What I lose:\na crash in one process restarts all three, and I can't scale them independently. Given a\ntwo-week single-user assignment, that trade is worth $0/month; for production it would not\nbe. **This is the decision I'm least sure about** — Render's cold-start on idle is a real\nrisk to the TTFT p95 gate, and I'm mitigating it only by warming the container before the\neval run rather than paying for always-on.\n- **Gemini 3.5 flash lite instead of Claude Sonnet 5.** I gave up some answer quality and the\n\"deep is clearly better\" human gate gets harder, in exchange for a free tier and much\nfaster tokens (which *helps* the TTFT and full-answer SLAs). The provider is swappable\nbehind one interface, so if quality costs me the human gate I can point `LLM_PROVIDER` at\nAnthropic without touching the loop.\n- **Gemini** `gemini-embedding-001` **at 1536-d instead of OpenAI** `text-embedding-3-small`**.**\nSame dimension so the Atlas index is unchanged; I gave up the marginally better-documented\nOpenAI model for a free tier, and took on Gemini's rate limits (which force me to batch and\npace ingestion).\n- **Atlas Vector Search instead of a dedicated vector store (Qdrant/pgvector).** One document\nper citation — the chunk text, its page locator, and its embedding live together, so a\ncitation is one read and `spaceId` is a plain filter inside `$vectorSearch`. The cost is\nthe M0 three-index ceiling: exactly 2 vector + 1 text, none to spare, so hybrid retrieval\nhas to fit in that budget.\n- **MAX_TOOL_CALLS=4** A quick answer is light enough that a ~0.1-vCPU box (free Render) survives the bench's concurrency-4 load; the cost is more wall-clock cap terminations."
   },
   "gates": [
     {
@@ -34,7 +34,7 @@
   ],
   "rubric": {
     "total": 100,
-    "awarded": 51,
+    "awarded": 60,
     "automated": [
       {
         "id": "ui_lights_up_contract",
@@ -42,7 +42,7 @@
         "points": 10,
         "awarded": 10,
         "status": "pass",
-        "evidence": "✓ contract probes (401/404/400): GET /memory without X-User-Id: 401 · GET /threads/thr_nope (unknown id): 404 · POST /threads/thr_x/ask with an empty body: 400 · GET /evals/report.json without X-User-Id: 404 · ✓ sources before the first token: every answer sent its sources event before its first token · ✓ /health names model, provider, store: /health names gemini-3.5-flash-lite · tavily · atlas-vector-search · db ok",
+        "evidence": "✓ contract probes (401/404/400): GET /memory without X-User-Id: 401 · GET /threads/thr_nope (unknown id): 404 · POST /threads/thr_x/ask with an empty body: 400 · GET /evals/report.json without X-User-Id: 200 · ✓ sources before the first token: every answer sent its sources event before its first token · ✓ /health names model, provider, store: /health names gemini-3.5-flash-lite · tavily · atlas-vector-search · db ok",
         "rules": [
           "C1"
         ]
@@ -51,9 +51,9 @@
         "id": "search_cited_answers",
         "label": "Search & cited answers",
         "points": 20,
-        "awarded": 7,
+        "awarded": 13,
         "status": "partial",
-        "evidence": "✗ citation grounding >= 0.95: citation grounding 0.8 over 85 verifiable citations, 0 dangling · ✗ search cache hits on repeats: search cache hit rate 12.5% on a workload that is 50% repeats",
+        "evidence": "✗ citation grounding >= 0.95: citation grounding 0.759 over 87 verifiable citations, 0 dangling",
         "rules": [
           "E2"
         ]
@@ -73,7 +73,7 @@
         "points": 15,
         "awarded": 9,
         "status": "partial",
-        "evidence": "✗ 202 accept p95 < 300ms: 202 accept p95 2834ms · ✗ mode=auto picks documents: mode=auto never touched the Space on a corpus question",
+        "evidence": "✗ 202 accept p95 < 300ms: 202 accept p95 2036ms · ✗ mode=auto picks documents: mode=auto never touched the Space on a corpus question",
         "rules": [
           "E1",
           "E2"
@@ -96,9 +96,9 @@
         "id": "performance_sla",
         "label": "Performance & SLA gate",
         "points": 10,
-        "awarded": 0,
-        "status": "fail",
-        "evidence": "✗ bench.mjs exits 0: 8 SLA target(s) missed · ✗ the quick gear stayed in its own envelope: 4/75 quick run(s) exceeded $0.05 or 8 tool calls · ✗ no error-severity quality failure: quality: 1 error(s), 2 warning(s) over 65 run log(s)",
+        "awarded": 3,
+        "status": "partial",
+        "evidence": "✗ bench.mjs exits 0: 5 SLA target(s) missed · ✗ no error-severity quality failure: quality: 1 error(s), 1 warning(s) over 63 run log(s)",
         "rules": [
           "B1",
           "B2",
@@ -113,7 +113,7 @@
         "points": 5,
         "awarded": 5,
         "status": "pass",
-        "evidence": "✓ one X-Request-Id correlates both logs: 71/71 answers returned an X-Request-Id to correlate the two logs · ✓ /stats reconciles with the run: /stats.answers=216 against 71 answers this run · ✓ every failed tool call carries an error (A1): A1: 65 run(s)",
+        "evidence": "✓ one X-Request-Id correlates both logs: 71/71 answers returned an X-Request-Id to correlate the two logs · ✓ /stats reconciles with the run: /stats.answers=307 against 71 answers this run · ✓ every failed tool call carries an error (A1): A1: 63 run(s)",
         "rules": [
           "A1"
         ]
@@ -162,7 +162,7 @@
       {
         "check": "no run that hit a cap reported as terminated=done (A2)",
         "ok": true,
-        "detail": "65 run(s)"
+        "detail": "63 run(s)"
       },
       {
         "check": "plan_research never called from a quick search: depth is opted into, never drifted into (R2)",
@@ -172,19 +172,19 @@
       {
         "check": "no 2xx answer served on a provider exception (A1)",
         "ok": true,
-        "detail": "65 run(s)"
+        "detail": "63 run(s)"
       }
     ]
   },
   "bench": {
-    "ranAt": "2026-09-25T03:50:52.633Z",
+    "ranAt": "2026-09-25T07:08:56.299Z",
     "target": "https://lumina-backend-k4ub.onrender.com",
     "pass": false,
     "sla": [
       {
         "metric": "ttft p95",
         "target": 2500,
-        "actual": 29154,
+        "actual": 21478,
         "unit": "ms",
         "comparator": "<=",
         "pass": false
@@ -192,7 +192,7 @@
       {
         "metric": "answer p95",
         "target": 12000,
-        "actual": 30212,
+        "actual": 22356,
         "unit": "ms",
         "comparator": "<=",
         "pass": false
@@ -200,7 +200,7 @@
       {
         "metric": "202 accept p95",
         "target": 300,
-        "actual": 2834,
+        "actual": 2214,
         "unit": "ms",
         "comparator": "<=",
         "pass": false
@@ -208,10 +208,10 @@
       {
         "metric": "search p95 during ingest / idle",
         "target": 1.3,
-        "actual": 3.487,
+        "actual": 0.941,
         "unit": "×",
         "comparator": "<=",
-        "pass": false
+        "pass": true
       },
       {
         "metric": "recall@5",
@@ -224,23 +224,23 @@
       {
         "metric": "search cache hit rate",
         "target": 50,
-        "actual": 12.5,
+        "actual": 62.5,
         "unit": "%",
         "comparator": ">=",
-        "pass": false
+        "pass": true
       },
       {
         "metric": "deep plan p95",
         "target": 4000,
-        "actual": 28344,
+        "actual": 3213,
         "unit": "ms",
         "comparator": "<=",
-        "pass": false
+        "pass": true
       },
       {
         "metric": "deep answer p95",
         "target": 90,
-        "actual": 117,
+        "actual": 151.9,
         "unit": "s",
         "comparator": "<=",
         "pass": false
@@ -256,7 +256,7 @@
       {
         "metric": "deep/quick source ratio (min)",
         "target": 2,
-        "actual": 3,
+        "actual": 4,
         "unit": "×",
         "comparator": ">=",
         "pass": true
@@ -264,7 +264,7 @@
       {
         "metric": "cost per deep answer",
         "target": 0.35,
-        "actual": 0.244,
+        "actual": 0.1682,
         "unit": "$",
         "comparator": "<=",
         "pass": true
@@ -272,7 +272,7 @@
       {
         "metric": "citation grounding",
         "target": 0.95,
-        "actual": 0.8,
+        "actual": 0.759,
         "unit": "",
         "comparator": ">=",
         "pass": false
@@ -288,7 +288,7 @@
       {
         "metric": "cost per answer (quick)",
         "target": 0.05,
-        "actual": 0.0296,
+        "actual": 0.0221,
         "unit": "$",
         "comparator": "<=",
         "pass": true
@@ -310,33 +310,33 @@
         "pass": true
       }
     ],
-    "citationGrounding": 0.8,
+    "citationGrounding": 0.7586206896551724,
     "recallAt5": 0.9,
     "retrievalRate": 1,
     "errorRate": 0,
     "latency": {
-      "ttftP50Ms": 9753,
-      "ttftP95Ms": 29154,
-      "answerP50Ms": 10908,
-      "answerP95Ms": 30212,
-      "accept202P95Ms": 2834
+      "ttftP50Ms": 8527,
+      "ttftP95Ms": 21478,
+      "answerP50Ms": 9488,
+      "answerP95Ms": 22356,
+      "accept202P95Ms": 2214
     },
     "cost": {
-      "meanCostPerAnswerUsd": 0.029554533333333334,
-      "meanCostPerDeepAnswerUsd": 0.2440365,
-      "declaredPriceTableUsd": 0.0330219746835443,
-      "projectedMonthlyUsd": 5100.272999999999,
-      "projectedMonthlyNoCacheUsd": 3055.4533333333334
+      "meanCostPerAnswerUsd": 0.022097000000000006,
+      "meanCostPerDeepAnswerUsd": 0.1682265,
+      "declaredPriceTableUsd": 0.03142001265822786,
+      "projectedMonthlyUsd": 3670.9950000000003,
+      "projectedMonthlyNoCacheUsd": 2709.7000000000007
     },
-    "searchCacheHitRatePct": 12.5,
+    "searchCacheHitRatePct": 62.5,
     "answers": 79
   },
   "quality": {
     "project": "Assignment_1_Lumina",
-    "checkedAt": "2026-09-25T03:56:34.192Z",
-    "runs": 65,
+    "checkedAt": "2026-09-25T07:23:37.601Z",
+    "runs": 63,
     "errors": 1,
-    "warnings": 2,
+    "warnings": 1,
     "results": [
       {
         "id": "C1",
@@ -350,21 +350,21 @@
         "title": "Tool errors surface as errors",
         "severity": "error",
         "status": "pass",
-        "detail": "65 run(s)"
+        "detail": "63 run(s)"
       },
       {
         "id": "A2",
         "title": "The loop terminates because it finished",
         "severity": "error",
         "status": "pass",
-        "detail": "65 run(s)"
+        "detail": "63 run(s)"
       },
       {
         "id": "A3",
         "title": "No tool thrash",
         "severity": "warn",
         "status": "pass",
-        "detail": "65 run(s)"
+        "detail": "63 run(s)"
       },
       {
         "id": "R1",
@@ -392,7 +392,7 @@
         "title": "Declared eval thresholds are met",
         "severity": "error",
         "status": "fail",
-        "detail": "citationGrounding=0.8 < 0.95"
+        "detail": "citationGrounding=0.759 < 0.95"
       },
       {
         "id": "E3",
@@ -406,21 +406,21 @@
         "title": "Token budget respected",
         "severity": "error",
         "status": "pass",
-        "detail": "65 run(s)"
+        "detail": "63 run(s)"
       },
       {
         "id": "B2",
         "title": "Latency budget respected",
         "severity": "warn",
-        "status": "fail",
-        "detail": "req_3e78a56d-3c2: 240.288s > 240s"
+        "status": "pass",
+        "detail": "63 run(s)"
       },
       {
         "id": "B3",
         "title": "Cost budget respected",
         "severity": "warn",
         "status": "pass",
-        "detail": "65 run(s)"
+        "detail": "63 run(s)"
       },
       {
         "id": "P1",
@@ -440,14 +440,94 @@
   },
   "trajectories": {
     "successful": {
-      "requestId": "MISSING-successful",
-      "steps": [],
-      "notes": "MISSING — pass --successful <requestId> naming a run log in runs/ (or runs/failing/). Rule P1 is the human gate: you read one successful and one failing trajectory, every step, and say what each taught you. It cannot be automated and cannot be skipped."
+      "requestId": "req_2f9d4048-954",
+      "terminated": "done",
+      "steps": [
+        {
+          "step": 1,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 1918
+        },
+        {
+          "step": 2,
+          "tool": "fetch_page",
+          "ok": false,
+          "ms": 136,
+          "error": "fetch 403 for https://www.britannica.com/place/Gurugram"
+        },
+        {
+          "step": 3,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 1365
+        },
+        {
+          "step": 4,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 674
+        }
+      ],
+      "notes": "Quick web run, terminated done in 8.2s. Step 2 (fetch_page britannica.com) 403'd and was logged ok:false with the real error — not swallowed. The loop re-searched (step 3), fetched a reachable page (step 4), then answered. The fail-loud contract working end to end: a blocked fetch is a recorded failure the model routes around, never a silent empty read."
     },
     "failing": {
-      "requestId": "MISSING-failing",
-      "steps": [],
-      "notes": "MISSING — pass --failing <requestId> naming a run log in runs/ (or runs/failing/). Rule P1 is the human gate: you read one successful and one failing trajectory, every step, and say what each taught you. It cannot be automated and cannot be skipped."
+      "requestId": "req_1988829f-765",
+      "terminated": "cap",
+      "steps": [
+        {
+          "step": 1,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 1881
+        },
+        {
+          "step": 2,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 9790
+        },
+        {
+          "step": 3,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 0
+        },
+        {
+          "step": 4,
+          "tool": "fetch_page",
+          "ok": false,
+          "ms": 67,
+          "error": "fetch 403 for https://r.jina.ai/http://en.wikipedia.org/wiki/Retrieval-augmented_generation"
+        },
+        {
+          "step": 5,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 1684
+        },
+        {
+          "step": 6,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 2575
+        },
+        {
+          "step": 7,
+          "tool": "fetch_page",
+          "ok": false,
+          "ms": 36,
+          "error": "fetch 403 for https://r.jina.ai/http://cc.bingj.com/cache.aspx?d=503-3325-1245&w=5c2c5e5e5e5e"
+        },
+        {
+          "step": 8,
+          "tool": "fetch_page",
+          "ok": false,
+          "ms": 32,
+          "error": "fetch 403 for https://r.jina.ai/http://en.wikipedia.org/wiki/Retrieval-augmented_generation"
+        }
+      ],
+      "notes": "Quick web run that hit the 8-tool cap and terminated 'cap' with an honest partial instead of looping. Three fetch_page calls (via an r.jina.ai proxy) 403'd; each is recorded ok:false with its error string — no swallowed failure, no fabricated 'couldn't find anything' success. Shows both guardrails at once: per-tool honest error logging and the hard cap ending a non-converging run."
     }
   }
 }
