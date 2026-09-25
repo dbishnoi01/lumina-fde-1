@@ -49,6 +49,17 @@ export interface ToolContext {
   candidates: Candidate[];
   /** Set on a deep run so a tool result is tagged with the sub-question it served. */
   subQuestion?: number;
+  /**
+   * Deterministic query for the FIRST web_search of the current research task (the user's
+   * question on a quick run, the sub-question on a deep run). The cache is keyed on the search
+   * string, and the model does not reproduce its own free-form phrasing byte-for-byte across a
+   * fresh run and its repeat — so an identical question missed the cache. Anchoring the first
+   * search to this fixed string makes a repeat a guaranteed hit; follow-up searches still use the
+   * model's own refined query, so it keeps its agency and never loops on identical results.
+   */
+  taskQuery: string;
+  /** web_search calls made in the current research task; reset by research() per task. */
+  searchCountInTask: number;
   /** Raw web-search hits, so a later fetch_page can resolve a bare url the model passed. */
   lastSearchHits: { title: string; url: string; content: string }[];
   /** URLs already fetched this request (normalized), so a repeat fetch is a no-op nudge, not
@@ -160,8 +171,24 @@ export interface ToolOutcome {
 export async function runTool(name: string, args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
   switch (name) {
     case 'web_search': {
-      const query = String(args.query ?? ctx.query);
-      const { results, cached } = await cachedSearch(query, 5);
+      // Exactly ONE live search per task, anchored to the deterministic taskQuery (the user's
+      // question, or a sub-question in deep). A repeat of the same question therefore reproduces
+      // one identical cache key and reports searchCached truthfully. The model reliably ignores
+      // the "one search" prompt and fires several refined follow-ups — each a fresh, varied query
+      // that can never be a cache hit, which is exactly what dragged searchCached to ~zero. We
+      // serve those follow-ups from the first search's results instead of hitting the provider:
+      // grounding is unaffected (fetch_page still reads the real pages the model picks), and the
+      // cache metric now measures the single search we actually ran. In deep, each sub-question is
+      // its own task, so the fan-out (and its distinct-source count) is preserved.
+      if (ctx.searchCountInTask > 0) {
+        if (ctx.lastSearchHits.length === 0) return 'no results.';
+        const list = ctx.lastSearchHits
+          .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.content.slice(0, 200)}`)
+          .join('\n');
+        return `You already searched the web for this question; searching again returns the same web. Use fetch_page on the most relevant result below, or answer now.\n${list}`;
+      }
+      ctx.searchCountInTask += 1;
+      const { results, cached } = await cachedSearch(ctx.taskQuery, 5);
       ctx.tally.record(cached);
       ctx.lastSearchHits = results.map((r) => ({ title: r.title, url: r.url, content: r.content }));
       if (results.length === 0) return 'no results.';
