@@ -17,7 +17,16 @@ import { db } from './db.js';
 import { env } from './env.js';
 import { webSearch, type SearchResult } from './providers/search.js';
 
-const normalize = (q: string) => q.toLowerCase().replace(/\s+/g, ' ').trim();
+// Normalize aggressively so trivial phrasing differences between a fresh run and its repeat
+// (case, surrounding quotes, trailing "?"/punctuation, doubled whitespace) collapse to the same
+// key instead of splitting the cache and forcing a second live call.
+const normalize = (q: string) =>
+  q
+    .toLowerCase()
+    .replace(/["'`“”‘’]/g, '') // strip quotes the model sometimes wraps a query in
+    .replace(/[?!.,;:]+$/g, '') // drop trailing sentence punctuation
+    .replace(/\s+/g, ' ')
+    .trim();
 
 function cacheKey(query: string, provider: string): string {
   return createHash('sha256').update(`${normalize(query)}::${provider}`).digest('hex');

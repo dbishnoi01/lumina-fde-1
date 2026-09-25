@@ -123,6 +123,7 @@ async function research(
   const tools = toolsFor(params.depth, params.mode, Boolean(params.spaceId));
   const messages: LlmMessage[] = [...task];
   let localCalls = 0;
+  ctx.searchCountInTask = 0; // first web_search of this task anchors to ctx.taskQuery
 
   for (;;) {
     if (state.toolCallsLog.length >= state.maxToolCalls || localCalls >= localToolBudget) {
@@ -315,6 +316,7 @@ export async function runAsk(params: AskParams): Promise<void> {
           break;
         }
         ctx.subQuestion = sq.i;
+        ctx.taskQuery = sq.question; // anchor this sub-question's first search deterministically
         const task: LlmMessage[] = [
           { role: 'system', content: system },
           {
